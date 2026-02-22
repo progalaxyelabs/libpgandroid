@@ -96,7 +96,7 @@ diff --git a/src/include/port/android_pgandroid.h b/src/include/port/android_pga
 new file mode 100644
 --- /dev/null
 +++ b/src/include/port/android_pgandroid.h
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,271 @@
 +/* src/include/port/android_pgandroid.h
 + *
 + * Android-specific compatibility header for pgandroid.
@@ -433,7 +433,7 @@ new file mode 100644
 diff --git a/src/backend/port/posix_sema.c b/src/backend/port/posix_sema.c
 --- a/src/backend/port/posix_sema.c
 +++ b/src/backend/port/posix_sema.c
-@@ -1,6 +1,8 @@
+@@ -1,6 +1,9 @@
  /*
   * src/backend/port/posix_sema.c
   *
@@ -464,7 +464,7 @@ diff --git a/src/backend/storage/ipc/ipc.c b/src/backend/storage/ipc/ipc.c
   */
 
  /*
-@@ -60,7 +63,8 @@ pg_proc_exit(int code)
+@@ -60,7 +63,7 @@ pg_proc_exit(int code)
       * Return gracefully on code 66 (pgandroid/PGlite graceful shutdown):
       * run on_proc_exit callbacks but do NOT call exit() — return to JNI.
       */

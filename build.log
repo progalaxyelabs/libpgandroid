@@ -1,0 +1,24 @@
+========================================================
+ pgAndroid build
+========================================================
+  Architecture : arm64-v8a
+  Triple       : aarch64-linux-android
+  NDK          : /hdd1/android-dev/sdk/ndk/27.2.12479018
+  CC           : /hdd1/android-dev/sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang
+  OpenSSL      : /ssd2/projects/progalaxy-elabs/divisions/opensource/pgandroid/deps/openssl-android-arm64
+  Jobs         : 12
+  Debug        : false
+  Project      : /ssd2/projects/progalaxy-elabs/divisions/opensource/pgandroid
+========================================================
+
+[source] Copying upstream/postgres-pglite -> build/pg-src ...
+[patches] Applying pgandroid patches ...
+Applying pgandroid patches to: /ssd2/projects/progalaxy-elabs/divisions/opensource/pgandroid/build/pg-src
+
+  APPLY 001-android-platform.patch ... Applying: Android platform detection, headers, and __ANDROID_PGANDROID__ guards
+Patch failed at 0001 Android platform detection, headers, and __ANDROID_PGANDROID__ guards
+patching file src/include/port/android.h
+patching file src/include/port/android_pgandroid.h
+patch: **** malformed patch at line 371: diff --git a/src/template/android b/src/template/android
+
+FAILED

@@ -3,6 +3,7 @@ package com.pgandroid
 import android.content.Context
 import java.io.Closeable
 import java.io.File
+import java.io.FileOutputStream
 
 /**
  * Main entry point for interacting with an embedded PostgreSQL database.
@@ -54,11 +55,39 @@ class PgDatabase private constructor(private var handle: Long) : Closeable {
          * @return         A ready-to-use [PgDatabase] instance.
          * @throws RuntimeException if PostgreSQL initialization fails.
          */
+        // Extract PostgreSQL share files from APK assets to internal storage.
+        // Must be called before the first [nativeOpen] so initdb can find
+        // postgres.bki and the SQL bootstrap files.
+        // Extracts assets/pgandroid/share/ to filesDir/pgandroid/share/.
+        private fun extractShareAssets(context: Context) {
+            val shareDir = File(context.filesDir, "pgandroid/share")
+            if (shareDir.exists() && shareDir.list()?.isNotEmpty() == true) {
+                return   // already extracted
+            }
+            shareDir.mkdirs()
+            val assetManager = context.assets
+            val assetFiles = assetManager.list("pgandroid/share") ?: return
+            for (name in assetFiles) {
+                val dest = File(shareDir, name)
+                if (!dest.exists()) {
+                    assetManager.open("pgandroid/share/$name").use { input ->
+                        FileOutputStream(dest).use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                }
+            }
+        }
+
         fun open(
             context: Context,
             dbName: String,
             config: PgConfig = PgConfig.default()
         ): PgDatabase {
+            // Extract PostgreSQL share files (postgres.bki, SQL scripts) from
+            // APK assets to device storage.  initdb needs these at runtime.
+            extractShareAssets(context)
+
             val dataDir = File(context.filesDir, "pgandroid/$dbName")
             dataDir.mkdirs()
 
