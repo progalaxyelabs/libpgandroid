@@ -5,6 +5,10 @@ build/
 *.a
 *.out
 
+# Track pre-built .so symlinks in jniLibs/ (they point to out/ but must be
+# committed so the Android build can find them without a prior native build).
+!**/jniLibs/**/*.so
+
 # NDK / SDK (installed on host, not in repo)
 ndk/
 sdk/
@@ -19,3 +23,6 @@ sdk/
 
 # Upstream PostgreSQL source (cloned for analysis, not committed)
 upstream/
+
+# Cross-compiled third-party dependencies (built locally, not committed)
+deps/
