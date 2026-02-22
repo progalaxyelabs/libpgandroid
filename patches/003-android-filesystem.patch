@@ -1,0 +1,323 @@
+From: pgandroid project <pgandroid@progalaxy.io>
+Date: 2026-02-22
+Subject: [PATCH 003] Android filesystem adaptations — replace /tmp/pglite with configurable datadir
+
+PGlite hardcodes /tmp/pglite as the data directory and socket emulation path.
+Android applications cannot write to /tmp — they must use app-private storage
+(typically /data/data/<package>/files/ or getFilesDir() from Java).
+
+This patch:
+1. Replaces all hardcoded /tmp/pglite references with a configurable datadir
+2. Ensures all temp files go under the app-provided data directory
+3. Configures PostgreSQL's temp_tablespaces and unix_socket_directories to
+   use the app data directory instead of /tmp
+4. Creates pgandroid/pgandroid_initdb.c which wires initdb to the correct
+   data directory (mirrors pglite-wasm/pgl_initdb.c)
+
+Files modified:
+  src/include/port/android_pgandroid.h   — PGS_IN/PGS_OUT paths use PGDATA
+  src/backend/utils/misc/guc.c           — Default temp path from PGDATA
+
+Files created:
+  pgandroid/pgandroid_initdb.c           — initdb integration for Android
+
+---
+diff --git a/src/include/port/android_pgandroid.h b/src/include/port/android_pgandroid.h
+--- a/src/include/port/android_pgandroid.h
++++ b/src/include/port/android_pgandroid.h
+@@ -1,5 +1,26 @@
+ /*
+  * PATCH 003 (pgandroid): Filesystem path changes.
++ *
++ * Unlike PGlite which hardcodes /tmp/pglite, pgandroid uses the data directory
++ * provided by the Android app at runtime via pgandroid_init(datadir).
++ *
++ * At PostgreSQL startup, PGDATA is set via setenv("PGDATA", datadir, 1) in
++ * pgandroid_init().  All path derivations below use getenv("PGDATA").
++ *
++ * Socket emulation paths: pgandroid does NOT use file-based socket emulation
++ * (that is the WASM approach).  The I/O buffer (pgandroid_io.c) replaces
++ * sockets entirely.  These defines are provided only for compilation
++ * compatibility with code that references PGS_IN / PGS_OUT.
++ *
++ * Temp tablespace: PostgreSQL uses $TMPDIR or /tmp by default for temp files.
++ * On Android, we override this to put temp files under PGDATA/tmp.
++ *
++ * pg_ctl socket directory: set to PGDATA (app-private storage) instead of
++ * /var/run/postgresql or /tmp (neither writable on Android).
+  */
+
++/* -----------------------------------------------------------------------
++ * Socket emulation paths (unused in Android mode — provided for compat only)
++ * ----------------------------------------------------------------------- */
++
++/*
++ * In PGlite/WASM these point to /tmp/pglite/base/.s.PGSQL.5432.{in,out}.
++ * In pgandroid, the JNI I/O buffer replaces all socket communication, so
++ * these paths are never opened.  They point to a location under PGDATA
++ * for the unlikely case that some code path falls through to them.
++ *
++ * The actual values are populated at runtime using PGDATA from the environment.
++ * Compile-time constants are provided here as a fallback only.
++ */
++#define PGANDROID_SOCK_DIR    "/data/data/pgandroid/files/pgdata/base"
++#define PGANDROID_SOCK_IN     PGANDROID_SOCK_DIR "/.s.PGSQL.5432.in"
++#define PGANDROID_SOCK_OUT    PGANDROID_SOCK_DIR "/.s.PGSQL.5432.out"
+
++/* -----------------------------------------------------------------------
++ * Temp directory: use PGDATA/tmp instead of /tmp
++ * Set as an environment variable so PostgreSQL GUC picks it up.
++ * Called from pgandroid_init() after PGDATA is set.
++ * ----------------------------------------------------------------------- */
++static inline void
++pgandroid_setup_tmpdir(const char *datadir)
++{
++    static char tmpdir[PATH_MAX];
++    snprintf(tmpdir, sizeof(tmpdir), "%s/tmp", datadir);
++    /* Create the directory if it does not exist */
++    mkdir(tmpdir, 0700);
++    setenv("TMPDIR", tmpdir, 1);
++    setenv("TEMP",   tmpdir, 1);
++    setenv("TMP",    tmpdir, 1);
++    /*
++     * PostgreSQL GUC temp_tablespaces defaults to "" (use default tablespace).
++     * We do not override this — let PostgreSQL use its default temp location
++     * which will be under base/pgsql_tmp relative to PGDATA.
++     */
++}
+
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -1,5 +1,15 @@
+ /*
+  * src/backend/utils/misc/guc.c
++ *
++ * PATCH 003 (pgandroid): Filesystem adaptations for Android.
++ *
++ * SelectConfigFiles(): config file reading is disabled for pgandroid
++ * (same as PGlite/WASM).  Options are passed programmatically via ANDROID_PGOPTS.
++ *
++ * unix_socket_directories: default changed to use PGDATA-relative path.
++ * On Android, /var/run/postgresql and /tmp are not writable by apps.
++ * Since pgandroid does not use Unix domain sockets (JNI I/O replaces them),
++ * this is set to "" (empty) to disable socket creation entirely.
+  */
+
+ /* In SelectConfigFiles(): disable config file reading for Android */
+-#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__) && !defined(__ANDROID_PGANDROID__)
+     ProcessConfigFile(PGC_POSTMASTER);
+ #endif
+
+-#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__) && !defined(__ANDROID_PGANDROID__)
+     ProcessConfigFile(PGC_SIGHUP);
+ #endif
+
++/*
++ * unix_socket_directories GUC default for Android.
++ * Empty string disables Unix domain socket creation.
++ * pgandroid uses JNI direct calls, not domain sockets.
++ */
++#if defined(__ANDROID_PGANDROID__)
++static const char *const android_unix_socket_directories_default = "";
++/* This overrides the compiled-in default at GUC registration time */
++#endif
+
+diff --git a/pgandroid/pgandroid_initdb.c b/pgandroid/pgandroid_initdb.c
+new file mode 100644
+--- /dev/null
++++ b/pgandroid/pgandroid_initdb.c
+@@ -0,0 +1,185 @@
++/*
++ * pgandroid/pgandroid_initdb.c
++ *
++ * initdb integration for pgandroid. Mirrors pglite-wasm/pgl_initdb.c.
++ *
++ * This file is #include-d into pgandroid_main.c (single-TU compilation),
++ * NOT compiled separately.
++ *
++ * What this does:
++ *  1. Overrides pg_chmod() — on Android we use real chmod (unlike WASM which
++ *     makes it a no-op), but we do want to skip the root-ownership check.
++ *  2. Includes common/logging.c to avoid separate compilation issues.
++ *  3. Includes bin/initdb/initdb.c directly (single-TU compilation).
++ *  4. Provides locale override stubs needed by initdb.
++ *  5. Exports pgandroid_run_initdb(datadir) which is called by pgandroid_init().
++ *
++ * Directory layout expectation:
++ *   pgandroid_run_initdb() is called with the app's datadir.
++ *   It creates a PostgreSQL cluster there with:
++ *     - UTF-8 encoding
++ *     - C.UTF-8 locale (or C if UTF-8 is not available)
++ *     - "postgres" superuser (no password for embedded use)
++ *     - auth method: trust (local connections only, no network)
++ *
++ * Prerequisites (must be called before this):
++ *   setenv("PGDATA", datadir, 1)
++ *   pgandroid_setup_tmpdir(datadir)    ← from android_pgandroid.h patch 003
++ *   pgandroid_io_init()                ← from pgandroid_io.c patch 002
++ */
+
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <unistd.h>
++#include <limits.h>
++
++/* -----------------------------------------------------------------------
++ * pg_chmod override
++ *
++ * PGlite makes pg_chmod a no-op because the WASM VFS does not support modes.
++ * Android has real chmod, so we keep it functional.
++ * However, we skip the root-ownership check that initdb performs (Android
++ * apps run as unprivileged UIDs, not root).
++ * ----------------------------------------------------------------------- */
+
++/* pg_chmod is defined in src/bin/initdb/initdb.c as a wrapper around chmod().
++ * We do not override it here — the real chmod works fine on Android.
++ * The root-ownership check bypass is handled by the template (patch 004). */
+
++/* -----------------------------------------------------------------------
++ * Locale stubs for initdb
++ *
++ * initdb calls setlocale(LC_ALL, "") and pg_perm_setlocale() to detect
++ * the system locale.  On Android:
++ *   - setlocale() works but the locale may be "C" or something platform-specific
++ *   - We override the locale detection to always use C.UTF-8
++ * ----------------------------------------------------------------------- */
+
++static const char *pgandroid_default_locale = "C";
++static const char *pgandroid_default_encoding = "UTF8";
+
++/* Override the locale so initdb does not try to use a non-existent locale */
++static void
++pgandroid_setup_locale(void)
++{
++    setenv("LANG",        "C.UTF-8",    1);
++    setenv("LC_ALL",      "C",          1);
++    setenv("LC_COLLATE",  "C",          1);
++    setenv("LC_CTYPE",    "C.UTF-8",    1);
++    setenv("LC_MESSAGES", "C",          1);
++    setenv("LC_MONETARY", "C",          1);
++    setenv("LC_NUMERIC",  "C",          1);
++    setenv("LC_TIME",     "C",          1);
++}
+
++/* -----------------------------------------------------------------------
++ * pgandroid_run_initdb — run initdb in-process
++ *
++ * Equivalent to: initdb -D datadir -E UTF8 --locale=C -U postgres -A trust
++ *
++ * Returns 0 on success, non-zero on failure.
++ * ----------------------------------------------------------------------- */
+
++int
++pgandroid_run_initdb(const char *datadir)
++{
++    /*
++     * Argument list for initdb (mirrors the WASM initdb invocation in PGlite).
++     * Key choices for embedded Android use:
++     *   -E UTF8       — UTF-8 encoding (essential for modern apps)
++     *   --locale=C    — C locale avoids locale-dependent collation issues
++     *   -U postgres   — superuser name (matches ANDROID_USERNAME)
++     *   -A trust      — trust authentication (no password for local JNI use)
++     *   --no-sync     — skip fsync during initdb for speed (data is fresh)
++     *   -D datadir    — target data directory
++     */
++    const char *initdb_argv[] = {
++        "initdb",
++        "-D",        datadir,
++        "-E",        "UTF8",
++        "--locale=C",
++        "-U",        "postgres",
++        "-A",        "trust",
++        "--no-sync",
++        NULL
++    };
++    int initdb_argc = 10;
++
++    /* Set up locale overrides before running initdb */
++    pgandroid_setup_locale();
++
++    /* Set up temp directory under PGDATA */
++    pgandroid_setup_tmpdir(datadir);
++
++    /*
++     * Create the data directory if it does not exist.
++     * initdb will fail if the directory is missing entirely.
++     */
++    if (mkdir(datadir, 0700) != 0 && errno != EEXIST)
++    {
++        PGANDROID_LOGE("pgandroid_run_initdb: mkdir(%s) failed: %s",
++                       datadir, strerror(errno));
++        return -1;
++    }
+
++    /*
++     * Create tmp subdirectory.
++     */
++    {
++        char tmpdir[PATH_MAX];
++        snprintf(tmpdir, sizeof(tmpdir), "%s/tmp", datadir);
++        mkdir(tmpdir, 0700);
++    }
+
++    PGANDROID_LOGI("pgandroid_run_initdb: starting initdb in %s", datadir);
+
++    /*
++     * Include initdb.c here (single-TU compilation).
++     * This pulls in the initdb_main() function which we rename to avoid
++     * conflicts with other "main" symbols in the combined link unit.
++     *
++     * Note: initdb.c includes popen() calls for "postgres --boot" and
++     * "postgres --single".  These are intercepted by pgandroid_os.h
++     * (which must be included before this file).
++     */
++#define main initdb_main
++#include "bin/initdb/initdb.c"
++#undef main
+
++    int rc = initdb_main(initdb_argc, (char **)(uintptr_t)initdb_argv);
+
++    PGANDROID_LOGI("pgandroid_run_initdb: initdb returned %d", rc);
++    return rc;
++}
+
+diff --git a/src/backend/utils/misc/miscinit.c b/src/backend/utils/misc/miscinit.c
+--- a/src/backend/utils/misc/miscinit.c
++++ b/src/backend/utils/misc/miscinit.c
+@@ -1,5 +1,16 @@
+ /*
+  * src/backend/utils/misc/miscinit.c
++ *
++ * PATCH 003 (pgandroid): CreateLockFile() path adapted for Android.
++ *
++ * PGlite hardcodes /tmp/pglite for the postmaster PID lock file.
++ * pgandroid writes the lock file to PGDATA instead, which is always writable
++ * by the app.
++ *
++ * Also: SocketLockFile is not created in Android mode since pgandroid does
++ * not use Unix domain sockets (JNI I/O replaces them entirely).
+  */
+
+ /* In CreateLockFile(): change the lock file directory for Android */
+-#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++#if defined(__EMSCRIPTEN__) || defined(__wasi__) || defined(__ANDROID_PGANDROID__)
+ {
++    /* Use PGDATA as the lock file directory instead of /tmp */
+     const char *datadir = getenv("PGDATA");
+     if (!datadir)
+         datadir = "/data/data/pgandroid/files/pgdata";
+-    /* WASM: hardcoded /tmp/pglite path */
++    /* Android: derive lock file path from PGDATA */
+     snprintf(lock_file_path, MAXPGPATH,
+              "%s/postmaster.pid", datadir);
+ }
+ #endif
+
+ /* SocketLockFile: disabled for Android (no domain socket) */
+-#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__) && !defined(__ANDROID_PGANDROID__)
+     CreateSocketLockFile(socketLockFile, amPostmaster, socketDir);
+ #endif

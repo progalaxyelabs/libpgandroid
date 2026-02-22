@@ -1,0 +1,280 @@
+From: pgandroid project <pgandroid@progalaxy.io>
+Date: 2026-02-22
+Subject: [PATCH 004] Android build system — Makefile.android + configure detection
+
+Android uses the NDK build system (CMake or ndk-build), not the WASM Emscripten
+toolchain. This patch:
+
+1. Creates src/makefiles/Makefile.android
+   - Standard make rules for Android NDK shared library compilation
+   - Parallel to Makefile.emscripten / Makefile.wasi
+
+2. Adds configure detection for Android NDK (aarch64-linux-android cross-compiler)
+   - Detects --host=aarch64-linux-android (or arm-linux-androideabi, x86_64-linux-android)
+   - Sets template=android automatically when NDK compiler detected
+
+3. Documents the CMake build path (recommended for production)
+   - The pgandroid repo contains CMakeLists.txt which calls configure internally
+   - Direct CMake use is simpler than the Makefile approach
+
+Note: The primary build system for pgandroid is CMakeLists.txt in the pgandroid
+repo (not in the postgres-pglite tree). Makefile.android is provided as an
+alternative for users who prefer make-based workflows or want to integrate
+with the existing PGlite build infrastructure.
+
+Files created:
+  src/makefiles/Makefile.android
+  src/template/android            (already in patch 001)
+
+Files modified:
+  configure.ac                    — Android NDK host detection
+  src/backend/Makefile            — Android link targets
+
+---
+diff --git a/src/makefiles/Makefile.android b/src/makefiles/Makefile.android
+new file mode 100644
+--- /dev/null
++++ b/src/makefiles/Makefile.android
+@@ -0,0 +1,121 @@
++# src/makefiles/Makefile.android
++#
++# Build rules for compiling PostgreSQL (pgandroid) with the Android NDK.
++# Parallel to Makefile.emscripten and Makefile.wasi.
++#
++# Usage (from configure output directory, after ./configure with template=android):
++#
++#   make -f src/makefiles/Makefile.android \
++#       NDK=/path/to/android-ndk-r27c \
++#       ANDROID_API=35 \
++#       ABI=arm64-v8a \
++#       PGANDROID_DIR=/path/to/pgandroid/entry-points \
++#       all
++#
++# This produces: libpgandroid.so
++#
++# Alternatively, use the CMakeLists.txt in the pgandroid repository which
++# handles the configure step internally and is the recommended approach.
++
++# -----------------------------------------------------------------------
++# NDK toolchain configuration
++# -----------------------------------------------------------------------
++
++NDK         ?= $(ANDROID_NDK_HOME)
++ANDROID_API ?= 26
++ABI         ?= arm64-v8a
++HOST        ?= aarch64-linux-android
++
++# Clang from the NDK's LLVM toolchain
++_TOOLCHAIN  := $(NDK)/toolchains/llvm/prebuilt/linux-x86_64
++_CLANG      := $(_TOOLCHAIN)/bin/$(HOST)$(ANDROID_API)-clang
++_AR         := $(_TOOLCHAIN)/bin/llvm-ar
++_STRIP      := $(_TOOLCHAIN)/bin/llvm-strip
++
++CC          := $(_CLANG)
++AR          := $(_AR)
++STRIP       := $(_STRIP)
++
++# -----------------------------------------------------------------------
++# pgandroid entry-point source directory
++# Set PGANDROID_DIR to the pgandroid/pgandroid/ directory
++# -----------------------------------------------------------------------
++
++PGANDROID_DIR ?= ../pgandroid/pgandroid
++
++# -----------------------------------------------------------------------
++# Compiler flags
++# -----------------------------------------------------------------------
++
++CFLAGS := \
++    -D__ANDROID_PGANDROID__ \
++    -DPGANDROID_MAIN \
++    -DPGANDROID_INITDB_MAIN \
++    -fPIC \
++    -fvisibility=hidden \
++    -O2 \
++    -Wall \
++    -Wno-unused-function \
++    -include $(PGANDROID_DIR)/android_pgandroid.h \
++    -D_GNU_SOURCE \
++    -DANDROID \
++    -DANDROID_NATIVE_API_LEVEL=$(ANDROID_API)
++
++# PostgreSQL include paths (set by configure)
++PG_INCLUDES := \
++    -I$(top_srcdir)/src/include \
++    -I$(top_srcdir)/src/include/port \
++    -I$(top_builddir)/src/include \
++    -I$(_TOOLCHAIN)/sysroot/usr/include \
++    -I$(_TOOLCHAIN)/sysroot/usr/include/$(HOST)
++
++CFLAGS += $(PG_INCLUDES)
++
++# -----------------------------------------------------------------------
++# Linker flags
++# -----------------------------------------------------------------------
++
++LDFLAGS := \
++    -shared \
++    -Wl,--build-id=sha1 \
++    -Wl,-soname,libpgandroid.so \
++    -Wl,--exclude-libs,ALL \
++    -landroid \
++    -llog \
++    -lc \
++    -lm \
++    -ldl
++
++# -----------------------------------------------------------------------
++# Source files
++#
++# The combined link unit: pgandroid_main.c pulls in all other sources
++# via #include (same pattern as PGlite's pg_main.c).
++# PostgreSQL's libpgcore.a and libpostgres.a are linked in.
++# -----------------------------------------------------------------------
++
++PGANDROID_SRCS := \
++    $(PGANDROID_DIR)/pgandroid_main.c \
++    $(PGANDROID_DIR)/pgandroid_io.c
++
++PG_LIBS := \
++    $(top_builddir)/src/backend/libpgcore.a \
++    $(top_builddir)/src/backend/libpostgres.a \
++    $(top_builddir)/src/common/libpgcommon_srv.a \
++    $(top_builddir)/src/port/libpgport_srv.a
++
++# -----------------------------------------------------------------------
++# Build targets
++# -----------------------------------------------------------------------
++
++.PHONY: all clean strip install
++
++all: libpgandroid.so
++
++libpgandroid.so: $(PGANDROID_SRCS) $(PG_LIBS)
++	$(CC) $(CFLAGS) $(PGANDROID_SRCS) \
++	    -Wl,--whole-archive $(PG_LIBS) -Wl,--no-whole-archive \
++	    $(LDFLAGS) \
++	    -o $@
++
++strip: libpgandroid.so
++	$(STRIP) --strip-unneeded $<
++
++install: libpgandroid.so
++	install -D -m 755 $< $(DESTDIR)/lib/$<
++
++clean:
++	rm -f libpgandroid.so *.o
++
++diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -1,5 +1,35 @@
+ dnl configure.ac
+ dnl
++dnl PATCH 004 (pgandroid): Android NDK cross-compilation detection.
++dnl
++dnl When --host matches an Android target triple, automatically select
++dnl the android template and set __ANDROID_PGANDROID__ in CPPFLAGS.
++dnl
++dnl Supported host triples:
++dnl   aarch64-linux-android     (arm64-v8a, the primary Android ABI)
++dnl   armv7a-linux-androideabi  (armeabi-v7a, 32-bit ARM)
++dnl   i686-linux-android        (x86, emulator)
++dnl   x86_64-linux-android      (x86_64, emulator + some Chrome OS)
++
++dnl Check if we are cross-compiling for Android
++AC_MSG_CHECKING([whether building for Android (pgandroid)])
++pgandroid_build=no
++case "$host" in
++  aarch64-linux-android*|\
++  armv7a-linux-androideabi*|\
++  arm-linux-androideabi*|\
++  i686-linux-android*|\
++  x86_64-linux-android*)
++    pgandroid_build=yes
++    ;;
++esac
++AC_MSG_RESULT([$pgandroid_build])
++
++if test "$pgandroid_build" = yes; then
++  dnl Force the android template
++  template=android
++  dnl Add the pgandroid compile-time define
++  CPPFLAGS="$CPPFLAGS -D__ANDROID_PGANDROID__"
++  dnl Android does not support syslog
++  ac_cv_func_syslog=no
++  dnl Android bionic provides pthread (no -lpthread needed separately)
++  PTHREAD_LIBS=""
++  dnl Inform the user
++  AC_MSG_NOTICE([Configuring for Android (pgandroid) — template=android])
++fi
++
++AM_CONDITIONAL([PGANDROID], [test "$pgandroid_build" = yes])
+
+diff --git a/src/backend/Makefile b/src/backend/Makefile
+--- a/src/backend/Makefile
++++ b/src/backend/Makefile
+@@ -1,5 +1,30 @@
+ # src/backend/Makefile
+ #
++# PATCH 004 (pgandroid): Android link targets.
++#
++# Adds a 'android' target that produces:
++#   libpgcore.a      — relocatable archive of all backend object files
++#   libpostgres.a    — subset needed by pgandroid (same as WASM libpostgres.a)
++#
++# These archives are consumed by Makefile.android or CMakeLists.txt.
++#
++# Usage:
++#   make android NDK=... ANDROID_API=35 ABI=arm64-v8a
++#
++# The NDK clang compiler must be on PATH or NDK must be set.
++
++ifdef PGANDROID
++# When building with the android template, produce static archives
++# (libpgcore.a, libpostgres.a) that Makefile.android links into libpgandroid.so.
++
++android: all
++	$(AR) crs libpgcore.a $(OBJS)
++	$(AR) crs libpostgres.a \
++	    storage/ipc/ipc.o \
++	    storage/ipc/latch.o \
++	    storage/ipc/procsignal.o \
++	    storage/ipc/sinvaladt.o \
++	    storage/lmgr/proc.o \
++	    libpq/pqcomm.o \
++	    libpq/auth.o \
++	    libpq/be-fsstubs.o \
++	    tcop/postgres.o \
++	    utils/misc/guc.o \
++	    utils/misc/miscinit.o \
++	    utils/misc/timeout.o \
++	    access/transam/xact.o \
++	    postmaster/checkpointer.o \
++	    commands/dbcommands.o \
++	    commands/event_trigger.o \
++	    tcop/utility.o \
++	    utils/adt/ruleutils.o \
++	    bootstrap/bootstrap.o \
++	    port/posix_sema.o \
++	    port/sysv_shmem.o \
++	    storage/file/fd.o \
++	    storage/ipc/ipc.o
++
++.PHONY: android
++endif
++
++# -----------------------------------------------------------------------
++# CMake build path documentation
++#
++# For production Android builds, use CMakeLists.txt in the pgandroid repo:
++#
++#   cmake -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
++#         -DANDROID_ABI=arm64-v8a \
++#         -DANDROID_PLATFORM=android-35 \
++#         -DPGANDROID_POSTGRES_SRC=$(pwd) \
++#         -B build-android
++#   cmake --build build-android
++#
++# This is simpler and handles all the configure/make steps internally.
++# -----------------------------------------------------------------------

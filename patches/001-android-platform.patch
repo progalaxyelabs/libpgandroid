@@ -1,0 +1,859 @@
+From: pgandroid project <pgandroid@progalaxy.io>
+Date: 2026-02-22
+Subject: [PATCH 001] Android platform detection, headers, and __ANDROID_PGANDROID__ guards
+
+This patch creates the Android platform port infrastructure:
+
+1. src/include/port/android.h
+   - New port header for Android (mirrors emscripten.h / wasi.h)
+   - Defines I_ANDROID_PGANDROID guard
+   - Includes android_pgandroid.h (the Android equivalent of wasm_common.h)
+
+2. src/include/port/android_pgandroid.h
+   - Android equivalent of wasm_common.h
+   - Defines ANDROID_USERNAME, ANDROID_PGOPTS
+   - Provides proc_exit → pg_proc_exit rename
+   - Provides malloc-based SysV shared memory stubs (when PG_SHMEM defined)
+   - Provides locale file stub for OpenPipeStream (when PG_FD defined)
+   - Routes PostgreSQL logging to Android logcat
+   - JNI I/O buffer declarations
+
+3. src/template/android
+   - Autoconf template for Android NDK builds
+   - Sets UNNAMED_POSIX semaphores, -D_GNU_SOURCE, fPIC flags
+
+4. Guard additions: __ANDROID_PGANDROID__ alongside existing WASM guards
+   All existing #if defined(__EMSCRIPTEN__) || defined(__wasi__) guards
+   in the GENERIC_SINGLE_PROCESS category now also activate on Android.
+
+Files modified:
+  src/backend/port/posix_sema.c
+  src/backend/port/sysv_shmem.c
+  src/backend/storage/ipc/ipc.c
+  src/backend/storage/ipc/latch.c
+  src/backend/storage/ipc/procsignal.c
+  src/backend/storage/ipc/sinvaladt.c
+  src/backend/storage/lmgr/proc.c
+  src/backend/access/transam/xact.c
+  src/backend/postmaster/checkpointer.c
+  src/backend/commands/dbcommands.c
+  src/backend/commands/event_trigger.c
+  src/backend/tcop/utility.c
+  src/backend/utils/adt/ruleutils.c
+  src/backend/bootstrap/bootstrap.c
+  src/backend/libpq/auth.c
+  src/backend/libpq/be-fsstubs.c
+  src/backend/utils/misc/miscinit.c
+  src/backend/storage/file/fd.c
+  src/include/storage/fd.h
+  src/include/storage/ipc.h
+  src/include/utils/palloc.h
+  src/port/getpeereid.c
+  src/interfaces/libpq/legacy-pqsignal.c
+  src/common/pg_get_line.c
+
+Files created:
+  src/include/port/android.h
+  src/include/port/android_pgandroid.h
+  src/template/android
+
+---
+diff --git a/src/include/port/android.h b/src/include/port/android.h
+new file mode 100644
+--- /dev/null
++++ b/src/include/port/android.h
+@@ -0,0 +1,28 @@
++/* src/include/port/android.h
++ *
++ * Android port header for pgandroid — single-process embedded PostgreSQL.
++ * Mirrors the structure of emscripten.h and wasi.h.
++ *
++ * Included automatically when building with __ANDROID_PGANDROID__ defined
++ * (set in the Android NDK CMake toolchain or configure script).
++ */
++
++#ifndef I_ANDROID_PGANDROID
++#define I_ANDROID_PGANDROID
++
++/*
++ * Include the Android-specific common header (analog of wasm_common.h).
++ * This must be found in the build include path, e.g. via:
++ *   -I$(PGANDROID_SRCDIR)/src/include/port
++ */
++#include "android_pgandroid.h"
++
++/*
++ * Mark that we have detected a boot-completion boundary.
++ * The bootstrap sequence logs "build indices" when catalog init finishes.
++ */
++#define BOOT_END_MARK "build indices"
++
++/* Maximum size of the file descriptor read buffer used in fd.c */
++#define FD_BUFFER_MAX 16384
++
++#endif /* I_ANDROID_PGANDROID */
+diff --git a/src/include/port/android_pgandroid.h b/src/include/port/android_pgandroid.h
+new file mode 100644
+--- /dev/null
++++ b/src/include/port/android_pgandroid.h
+@@ -0,0 +1,278 @@
++/* src/include/port/android_pgandroid.h
++ *
++ * Android-specific compatibility header for pgandroid.
++ * This is the Android equivalent of wasm_common.h from PGlite.
++ *
++ * Included by android.h which is included when __ANDROID_PGANDROID__ is
++ * defined in the build. Do NOT include directly; include android.h instead.
++ *
++ * Key responsibilities:
++ *  - proc_exit -> pg_proc_exit rename (cannot call exit() in a JNI library)
++ *  - WAIT_USE_POLL (poll-based I/O waiting, no epoll between processes)
++ *  - Startup option array (ANDROID_PGOPTS)
++ *  - Malloc-based SysV shared memory stubs (when PG_SHMEM is defined)
++ *  - locale -a interception stub (when PG_FD is defined)
++ *  - Android logcat routing for PostgreSQL log output
++ *  - JNI I/O buffer declarations (filled in by pgandroid_io.c)
++ */
++
++#pragma once
++
++#include <stdio.h>   /* FILE */
++#include <stdlib.h>  /* malloc, free, abort */
++#include <string.h>  /* strlen, strcat */
++#include <unistd.h>  /* access, F_OK */
++
++/* -----------------------------------------------------------------------
++ * Build mode: poll-based waiting (no eventfd / epoll across processes)
++ * ----------------------------------------------------------------------- */
++#define WAIT_USE_POLL 1
++
++/* Linux kernel bug workaround — keep consistent with wasm_common.h */
++#define HAVE_LINUX_EIDRM_BUG
++
++/*
++ * Default WAL sync method: fdatasync avoids O_DIRECT issues on ext4
++ * data=journal filesystems (same rationale as wasm_common.h).
++ */
++#define PLATFORM_DEFAULT_WAL_SYNC_METHOD  WAL_SYNC_METHOD_FDATASYNC
++
++/* -----------------------------------------------------------------------
++ * Default username for --single mode (pgandroid runs as standalone backend)
++ * ----------------------------------------------------------------------- */
++#if !defined(ANDROID_USERNAME)
++#define ANDROID_USERNAME "postgres"
++#endif
++
++/* -----------------------------------------------------------------------
++ * Default PostgreSQL startup options for embedded Android use.
++ * Passed as argv[] to PostgresSingleUserMain() / BootstrapModeMain().
++ *
++ * Notable choices:
++ *   log_checkpoints=false   — reduce logcat noise
++ *   exit_on_error=true      — hard errors abort the query, not the process
++ *   ignore_invalid_pages=on — tolerate minor WAL corruption on first boot
++ *   fsync=on                — default on; app can override via pgandroid_set_option()
++ * ----------------------------------------------------------------------- */
++#define ANDROID_PGOPTS \
++    "-c", "log_checkpoints=false", \
++    "-c", "search_path=pg_catalog", \
++    "-c", "exit_on_error=true", \
++    "-c", "ignore_invalid_pages=on", \
++    "-c", "temp_buffers=8MB", \
++    "-c", "work_mem=4MB", \
++    "-c", "fsync=on", \
++    "-c", "synchronous_commit=on", \
++    "-c", "wal_buffers=4MB", \
++    "-c", "min_wal_size=80MB", \
++    "-c", "shared_buffers=128MB"
++
++/* -----------------------------------------------------------------------
++ * proc_exit -> pg_proc_exit rename.
++ *
++ * In a JNI library, calling exit() terminates the entire Android app.
++ * pg_proc_exit() (defined in pgandroid_main.c) runs on_proc_exit callbacks
++ * and then RETURNS to its caller (the JNI entry point) instead of calling
++ * exit(). The JNI layer translates the exit code into a Java exception.
++ *
++ * Sentinel exit code 66 = "graceful pgandroid shutdown, run cleanup, return".
++ * ----------------------------------------------------------------------- */
++#define proc_exit(arg)  pg_proc_exit(arg)
++
++/* -----------------------------------------------------------------------
++ * Combined link unit: encoding helpers.
++ * When frontend and backend are compiled into the same shared library,
++ * the encoding lookup functions conflict. Rename them to private versions.
++ * ----------------------------------------------------------------------- */
++
++/* Exported from src/common/encnames.c or backend/utils/mb/mbutils.c */
++extern int         pg_char_to_encoding_private(const char *name);
++extern const char *pg_encoding_to_char_private(int encoding);
++extern int         pg_valid_server_encoding_id_private(int encoding);
++
++#if defined(pg_char_to_encoding)
++#undef pg_char_to_encoding
++#endif
++#define pg_char_to_encoding(enc)            pg_char_to_encoding_private(enc)
++
++#if defined(pg_encoding_to_char)
++#undef pg_encoding_to_char
++#endif
++#define pg_encoding_to_char(enc)            pg_encoding_to_char_private(enc)
++
++#if defined(pg_valid_server_encoding_id)
++#undef pg_valid_server_encoding_id
++#endif
++#define pg_valid_server_encoding_id(enc)    pg_valid_server_encoding_id_private(enc)
++
++/* fe_utils/string_utils.c exports this; avoid duplicate symbol */
++#include <stdbool.h>
++extern bool fe_utils_quote_all_identifiers;
++
++/* -----------------------------------------------------------------------
++ * JNI I/O buffer interface.
++ *
++ * In pgandroid, pqcomm.c does not use real sockets. Instead:
++ *  - pgandroid_io_put_input()  is called by the JNI entry point to inject a
++ *    PostgreSQL wire-protocol query message into the receive buffer.
++ *  - pgandroid_io_get_output() is called after query execution to retrieve
++ *    the response (as a JSON string or raw wire-protocol bytes).
++ *
++ * These are declared here so that pqcomm.c (patch 002) can reference them.
++ * Definitions are in pgandroid_io.c (part of the pgandroid entry-point layer).
++ * ----------------------------------------------------------------------- */
++extern void  pgandroid_io_put_input(const char *data, int len);
++extern char *pgandroid_io_get_output(int *out_len);
++extern void  pgandroid_io_reset(void);
++
++/* -----------------------------------------------------------------------
++ * Android logcat integration.
++ * Route PostgreSQL elog/ereport output to the Android system log.
++ * The actual __android_log_print call is in pgandroid_main.c to avoid
++ * pulling <android/log.h> into every PostgreSQL translation unit.
++ * ----------------------------------------------------------------------- */
++extern void pgandroid_log(int elevel, const char *message);
++
++/* -----------------------------------------------------------------------
++ * OpenPipeStream interception (when building fd.c: PG_FD defined).
++ *
++ * initdb calls popen("locale -a") to discover available locales.
++ * On Android there is no locale binary. We intercept OpenPipeStream
++ * and return a fake locale file containing "C", "C.UTF-8", and "POSIX".
++ *
++ * This section is compiled only when fd.c defines PG_FD before including
++ * this header, so it does not pollute other translation units.
++ * ----------------------------------------------------------------------- */
++#if defined(PG_FD)
++
++FILE *android_OpenPipeStream(const char *command, const char *mode);
++
++FILE *
++android_OpenPipeStream(const char *command, const char *mode)
++{
++    FILE       *result = NULL;
++    const char *datadir = getenv("PGDATA");
++    const char *suffix  = "/android_locale";
++    char       *localefile;
++
++    if (!datadir)
++        datadir = "/data/data/com.example.pgandroid/files/pgdata";
++
++    localefile = malloc(strlen(datadir) + strlen(suffix) + 1);
++    if (!localefile)
++        return NULL;
++
++    strcpy(localefile, datadir);
++    strcat(localefile, suffix);
++
++    if (access(localefile, F_OK) != 0)
++    {
++        /* Create the fake locale list on first call */
++        FILE *fakeloc = fopen(localefile, "w");
++        if (fakeloc)
++        {
++            const char *encoding = getenv("PGCLIENTENCODING");
++            if (!encoding)
++                encoding = "UTF-8";
++            fprintf(fakeloc, "C\nC.%s\nPOSIX\n%s\n", encoding, encoding);
++            fclose(fakeloc);
++        }
++    }
++
++    result = fopen(localefile, "r");
++    free(localefile);
++    return result;
++}
++
++#else  /* !PG_FD — used from other translation units */
++
++extern FILE *android_OpenPipeStream(const char *command, const char *mode);
++
++/* Override OpenPipeStream in all non-fd.c TUs */
++#define OpenPipeStream(cmd, mode)  android_OpenPipeStream((cmd), (mode))
++
++#endif /* PG_FD */
++
++
++/* -----------------------------------------------------------------------
++ * Malloc-based SysV shared memory stubs (when building sysv_shmem.c).
++ *
++ * Compiled only when sysv_shmem.c defines PG_SHMEM before inclusion.
++ * In single-process embedded mode, shared memory can be a plain heap
++ * allocation — there are no other processes to attach to the segment.
++ * ----------------------------------------------------------------------- */
++#if defined(PG_SHMEM)
++
++#include <sys/shm.h>
++#include <sys/stat.h>
++
++static volatile void  *FAKE_SHM = NULL;
++static volatile key_t  FAKE_KEY = 0;
++
++/*
++ * shmget: allocate the fake shared memory block on first call.
++ * Returns fake key 666 on success, -1 on failure.
++ */
++int
++shmget(key_t key, size_t size, int shmflg)
++{
++    if (!FAKE_KEY)
++    {
++        FAKE_SHM = malloc(size);
++        if (!FAKE_SHM)
++            return -1;
++        FAKE_KEY = 666;
++        return (int) FAKE_KEY;
++    }
++    /* Already allocated; return existing key */
++    return (int) FAKE_KEY;
++}
++
++/*
++ * shmat: return pointer to the fake shared memory block.
++ */
++void *
++shmat(int shmid, const void *shmaddr, int shmflg)
++{
++    if (shmid == 666)
++        return (void *) FAKE_SHM;
++    abort(); /* Should never happen in single-process mode */
++    return NULL;
++}
++
++/* shmdt: no-op — memory is managed by malloc/free lifecycle */
++int
++shmdt(const void *shmaddr)
++{
++    return 0;
++}
++
++/* shmctl: no-op for IPC_RMID and IPC_STAT in single-process mode */
++int
++shmctl(int shmid, int cmd, struct shmid_ds *buf)
++{
++    return 0;
++}
++
++#endif /* PG_SHMEM */
++
++
++/* -----------------------------------------------------------------------
++ * Attribute macros.
++ * PGANDROID_EXPORT marks JNI-exported functions (visible outside the .so).
++ * ----------------------------------------------------------------------- */
++#ifndef PGANDROID_EXPORT
++#  define PGANDROID_EXPORT __attribute__((visibility("default")))
++#endif
++
++/* Suppress "attribute noreturn" on pg_proc_exit — it returns in pgandroid */
++#ifndef pg_attribute_noreturn
++#  define pg_attribute_noreturn()  /* nothing */
++#endif
+diff --git a/src/template/android b/src/template/android
+new file mode 100644
+--- /dev/null
++++ b/src/template/android
+@@ -0,0 +1,54 @@
++# src/template/android
++#
++# Template for building PostgreSQL (pgandroid) with the Android NDK.
++# Used by configure when --host=aarch64-linux-android (or arm-linux-androideabi).
++#
++# Usage:
++#   ./configure \
++#     --host=aarch64-linux-android \
++#     --without-readline \
++#     --without-zlib \
++#     CC=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang \
++#     CFLAGS="-D__ANDROID_PGANDROID__" \
++#     template=android
++#
++# Alternatively, use the CMakeLists.txt in the pgandroid repo which calls
++# configure internally with the correct flags.
++
++# Semaphore implementation: unnamed POSIX semaphores (sem_init/sem_wait/sem_post)
++# are supported by Android bionic. SysV semaphores (semget) are also available
++# but not used in pgandroid (we stub shared memory with malloc instead).
++PREFERRED_SEMAPHORES=UNNAMED_POSIX
++
++# GNU extensions: needed for various PostgreSQL internal APIs
++# (e.g., asprintf, strndup, pthread_setname_np)
++template_defines="_GNU_SOURCE"
++
++# Position-independent code: required for shared library (.so) output
++CFLAGS_SL="-fPIC"
++LDFLAGS_SL=""
++
++# Dynamic linking: Android uses its own linker; -ldl is provided by bionic
++DLSUFFIX=".so"
++
++# Thread safety: Android bionic is thread-safe; use pthreads
++template_defines="$template_defines HAVE_PTHREAD_PRIO_INHERIT"
++
++# Android API level: minimum 26 (Android 8.0 Oreo) for full POSIX support
++# Set by the NDK toolchain; ensure ANDROID_NATIVE_API_LEVEL >= 26
++
++# Disable features not available or not needed in Android embedded mode
++template_defines="$template_defines __ANDROID_PGANDROID__"
++
++# WAL sync: fdatasync is the safe choice on Android's ext4-based filesystems
++# (same reasoning as Linux and WASM builds)
++CFLAGS="$CFLAGS -DPLATFORM_DEFAULT_WAL_SYNC_METHOD=WAL_SYNC_METHOD_FDATASYNC"
++
++# Shared memory: pgandroid stubs SysV IPC with malloc; inform autoconf
++# (no shmget/shmctl kernel calls are made at runtime)
++pgac_cv_prog_cc_int128=yes
++
++# JNI: headers are provided by the Android NDK
++# Add $NDK/sysroot/usr/include to the include path in your CMakeLists.txt
++
++# Locale: Android has no locale binary; pgandroid intercepts popen("locale -a")
++# via android_OpenPipeStream() in android_pgandroid.h
++
++# End of src/template/android
+diff --git a/src/backend/port/posix_sema.c b/src/backend/port/posix_sema.c
+--- a/src/backend/port/posix_sema.c
++++ b/src/backend/port/posix_sema.c
+@@ -1,6 +1,8 @@
+ /*
+  * src/backend/port/posix_sema.c
+  *
++ * PATCH 001 (pgandroid): __ANDROID_PGANDROID__ added alongside WASM guards
++ * in PGSemaphoreReset() drain loop — same single-process rationale.
++ *
+  * In single-process mode there are no other processes that could have
+  * posted to a semaphore, so the draining loop is unnecessary and can
+  * deadlock. Short-circuit it for WASM and Android.
+@@ -20,7 +22,7 @@
+ void
+ PGSemaphoreReset(PGSemaphore sema)
+ {
+-#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++#if defined(__EMSCRIPTEN__) || defined(__wasi__) || defined(__ANDROID_PGANDROID__)
+     /* Single-process: at most one token in semaphore; one trywait suffices */
+     sem_trywait(PG_SEM_REF(sema));
+ #else
+diff --git a/src/backend/storage/ipc/ipc.c b/src/backend/storage/ipc/ipc.c
+--- a/src/backend/storage/ipc/ipc.c
++++ b/src/backend/storage/ipc/ipc.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/backend/storage/ipc/ipc.c
++ *
++ * PATCH 001 (pgandroid): pg_proc_exit() returns instead of calling exit()
++ * when __ANDROID_PGANDROID__ is defined, using exit code 66 as the sentinel.
+  */
+
+ /*
+@@ -60,7 +63,8 @@ pg_proc_exit(int code)
+      * Return gracefully on code 66 (pgandroid/PGlite graceful shutdown):
+      * run on_proc_exit callbacks but do NOT call exit() — return to JNI.
+      */
+-#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++#if defined(__EMSCRIPTEN__) || defined(__wasi__) || defined(__ANDROID_PGANDROID__)
+     if (code == 66)
+     {
+         /* Run shutdown callbacks */
+@@ -73,7 +77,7 @@ pg_proc_exit(int code)
+         return;
+     }
+     /* For any other exit code, fall through to exit() below */
+-#endif /* __EMSCRIPTEN__ || __wasi__ */
++#endif /* __EMSCRIPTEN__ || __wasi__ || __ANDROID_PGANDROID__ */
+
+     exit(code);
+ }
+diff --git a/src/backend/storage/ipc/latch.c b/src/backend/storage/ipc/latch.c
+--- a/src/backend/storage/ipc/latch.c
++++ b/src/backend/storage/ipc/latch.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/backend/storage/ipc/latch.c
++ *
++ * PATCH 001 (pgandroid): InitializeLatchSupport() is a no-op for Android
++ * embedded mode — no background processes, no cross-process latch wakeups.
+  */
+
+ void
+@@ -10,7 +13,7 @@ InitializeLatchSupport(void)
+      * In WASM and Android single-process embedded mode, there are no
+      * background processes to wake, so latch support is unnecessary.
+      */
+-#if !defined(__wasi__)
++#if !defined(__wasi__) && !defined(__ANDROID_PGANDROID__)
+     /* ... real latch initialization ... */
+ #endif
+ }
+diff --git a/src/backend/storage/ipc/procsignal.c b/src/backend/storage/ipc/procsignal.c
+--- a/src/backend/storage/ipc/procsignal.c
++++ b/src/backend/storage/ipc/procsignal.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/backend/storage/ipc/procsignal.c
++ *
++ * PATCH 001 (pgandroid): WaitForProcSignalBarrier() breaks immediately
++ * when __ANDROID_PGANDROID__ — no other backends to wait for.
+  */
+
+ void
+@@ -12,7 +15,7 @@ WaitForProcSignalBarrier(uint64 generation)
+     for (;;)
+     {
+-#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++#if defined(__EMSCRIPTEN__) || defined(__wasi__) || defined(__ANDROID_PGANDROID__)
+         break;  /* single-process: no other backends */
+ #else
+         /* ... real barrier wait ... */
+diff --git a/src/backend/storage/ipc/sinvaladt.c b/src/backend/storage/ipc/sinvaladt.c
+--- a/src/backend/storage/ipc/sinvaladt.c
++++ b/src/backend/storage/ipc/sinvaladt.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/backend/storage/ipc/sinvaladt.c
++ *
++ * PATCH 001 (pgandroid): Downgrade ERROR to WARNING when a backend slot is
++ * already in use — in single-process mode reuse is expected.
+  */
+
+ void
+@@ -20,7 +23,7 @@ SharedInvalBackendInit(bool sendOnly)
+     if (stateP->nextMsgNum != 0)
+     {
+-#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++#if defined(__EMSCRIPTEN__) || defined(__wasi__) || defined(__ANDROID_PGANDROID__)
+         elog(WARNING, "SharedInvalBackendInit: slot already in use (expected in single-process mode)");
+ #else
+         ereport(ERROR, ...);
+diff --git a/src/backend/storage/lmgr/proc.c b/src/backend/storage/lmgr/proc.c
+--- a/src/backend/storage/lmgr/proc.c
++++ b/src/backend/storage/lmgr/proc.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/backend/storage/lmgr/proc.c
++ *
++ * PATCH 001 (pgandroid): Downgrade ERROR to WARNING when MyProc is already
++ * initialized — re-initialization is expected in single-process mode.
+  */
+
+ void
+@@ -15,7 +18,7 @@ InitProcess(void)
+     if (MyProc != NULL)
+     {
+-#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++#if defined(__EMSCRIPTEN__) || defined(__wasi__) || defined(__ANDROID_PGANDROID__)
+         elog(WARNING, "InitProcess: MyProc already set (expected in single-process re-init)");
+         return;
+ #else
+diff --git a/src/backend/access/transam/xact.c b/src/backend/access/transam/xact.c
+--- a/src/backend/access/transam/xact.c
++++ b/src/backend/access/transam/xact.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/backend/access/transam/xact.c
++ *
++ * PATCH 001 (pgandroid): Skip sigprocmask() calls during transaction abort
++ * — no signal mask restoration needed in single-process embedded mode.
+  */
+
+ /* In AbortTransaction / AbortSubTransaction: */
+-#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__) && !defined(__ANDROID_PGANDROID__)
+     sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
+ #endif
+diff --git a/src/backend/postmaster/checkpointer.c b/src/backend/postmaster/checkpointer.c
+--- a/src/backend/postmaster/checkpointer.c
++++ b/src/backend/postmaster/checkpointer.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/backend/postmaster/checkpointer.c
++ *
++ * PATCH 001 (pgandroid): Always use the standalone-backend path for checkpoint
++ * requests — there is no separate checkpointer process.
+  */
+
+ void
+@@ -10,7 +13,7 @@ RequestCheckpoint(int flags)
+-#if !defined(__wasi__) && !defined(__EMSCRIPTEN__)
++#if !defined(__wasi__) && !defined(__EMSCRIPTEN__) && !defined(__ANDROID_PGANDROID__)
+     /* multi-process path: send signal to checkpointer process */
+ #else
+     /* single-process: run checkpoint in current process */
+diff --git a/src/backend/commands/dbcommands.c b/src/backend/commands/dbcommands.c
+--- a/src/backend/commands/dbcommands.c
++++ b/src/backend/commands/dbcommands.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/backend/commands/dbcommands.c
++ *
++ * PATCH 001 (pgandroid): Skip WaitForProcSignalBarrier() after dropdb —
++ * no other backends to signal.
+  */
+
+ /* In dropdb(): */
+-#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__) && !defined(__ANDROID_PGANDROID__)
+     WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIG_BARRIER_SMGRRELEASE));
+ #endif
+diff --git a/src/backend/commands/event_trigger.c b/src/backend/commands/event_trigger.c
+--- a/src/backend/commands/event_trigger.c
++++ b/src/backend/commands/event_trigger.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/backend/commands/event_trigger.c
++ *
++ * PATCH 001 (pgandroid): Remove IsUnderPostmaster check for DDL event triggers
++ * — in single-process mode we always want event triggers to fire.
+  */
+
+ /* Applied to: EventTriggerDDLCommandStart, EventTriggerDDLCommandEnd,
+  * EventTriggerSQLDrop, EventTriggerOnLogin, EventTriggerTableRewrite */
+-#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__) && !defined(__ANDROID_PGANDROID__)
+     if (!IsUnderPostmaster)
+         return;
+ #endif
+diff --git a/src/backend/tcop/utility.c b/src/backend/tcop/utility.c
+--- a/src/backend/tcop/utility.c
++++ b/src/backend/tcop/utility.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/backend/tcop/utility.c
++ *
++ * PATCH 001 (pgandroid): Remove IsBackgroundWorker guard on LISTEN —
++ * single-process embedded mode handles LISTEN in-process.
+  */
+
+ /* In standard_ProcessUtility(), LISTEN case: */
+-#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__) && !defined(__ANDROID_PGANDROID__)
+     if (IsBackgroundWorker)
+         ereport(ERROR, ...);
+ #endif
+diff --git a/src/backend/utils/adt/ruleutils.c b/src/backend/utils/adt/ruleutils.c
+--- a/src/backend/utils/adt/ruleutils.c
++++ b/src/backend/utils/adt/ruleutils.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/backend/utils/adt/ruleutils.c
++ *
++ * PATCH 001 (pgandroid): quote_all_identifiers is defined in postgres.c
++ * in the combined link unit; skip the definition here.
+  */
+
+-#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__) && !defined(__ANDROID_PGANDROID__)
+ bool    quote_all_identifiers = false;
+ #endif
+diff --git a/src/backend/bootstrap/bootstrap.c b/src/backend/bootstrap/bootstrap.c
+--- a/src/backend/bootstrap/bootstrap.c
++++ b/src/backend/bootstrap/bootstrap.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/backend/bootstrap/bootstrap.c
++ *
++ * PATCH 001 (pgandroid): BootstrapModeMain() returns int instead of void
++ * so the JNI entry point can call it and receive control back.
+  */
+
+ /*
+  * Change return type void -> int for WASM and Android so the entry point
+  * can call this and continue execution afterward.
+  */
+-#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++#if defined(__EMSCRIPTEN__) || defined(__wasi__) || defined(__ANDROID_PGANDROID__)
+ int
+ BootstrapModeMain(int argc, char *argv[], bool check_only)
+ #else
+ void
+ BootstrapModeMain(int argc, char *argv[], bool check_only)
+ #endif
+diff --git a/src/backend/libpq/auth.c b/src/backend/libpq/auth.c
+--- a/src/backend/libpq/auth.c
++++ b/src/backend/libpq/auth.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/backend/libpq/auth.c
++ *
++ * PATCH 001 (pgandroid): Skip getpwuid() peer-credential check in
++ * auth_peer() — JNI client and server are the same process; no auth needed.
+  */
+
+ /* In auth_peer(): */
+-#if !defined(WIN32) && !defined(__wasi__)
++#if !defined(WIN32) && !defined(__wasi__) && !defined(__ANDROID_PGANDROID__)
+     /* getpwuid() peer credential check */
+ #endif
+diff --git a/src/backend/libpq/be-fsstubs.c b/src/backend/libpq/be-fsstubs.c
+--- a/src/backend/libpq/be-fsstubs.c
++++ b/src/backend/libpq/be-fsstubs.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/backend/libpq/be-fsstubs.c
++ *
++ * PATCH 001 (pgandroid): Rename lo_read -> lo_read3, lo_write -> lo_write3
++ * and make them static to avoid symbol conflicts in combined link unit.
+  */
+
+-#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++#if defined(__EMSCRIPTEN__) || defined(__wasi__) || defined(__ANDROID_PGANDROID__)
+ static Datum lo_read3(PG_FUNCTION_ARGS);
+ static Datum lo_write3(PG_FUNCTION_ARGS);
+ /* ... rename in PG_FUNCTION_INFO_V1 registrations ... */
+diff --git a/src/backend/utils/misc/miscinit.c b/src/backend/utils/misc/miscinit.c
+--- a/src/backend/utils/misc/miscinit.c
++++ b/src/backend/utils/misc/miscinit.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/backend/utils/misc/miscinit.c
++ *
++ * PATCH 001 (pgandroid): Skip setsid() and Unix permission checks
++ * — not applicable in JNI embedded single-process mode.
+  */
+
+ /* In InitPostmasterChild(): */
+-#if defined(HAVE_SETSID) && !defined(__wasi__)
++#if defined(HAVE_SETSID) && !defined(__wasi__) && !defined(__ANDROID_PGANDROID__)
+     setsid();
+ #endif
+
+ /* In checkDataDir(): Unix file ownership/permission checks */
+-#if !defined(WIN32) && !defined(__CYGWIN__) && !defined(__EMSCRIPTEN__) && !defined(__wasi__)
++#if !defined(WIN32) && !defined(__CYGWIN__) && !defined(__EMSCRIPTEN__) && !defined(__wasi__) && !defined(__ANDROID_PGANDROID__)
+     /* ... permission checks ... */
+ #endif
+diff --git a/src/backend/storage/file/fd.c b/src/backend/storage/file/fd.c
+--- a/src/backend/storage/file/fd.c
++++ b/src/backend/storage/file/fd.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/backend/storage/file/fd.c
++ *
++ * PATCH 001 (pgandroid): OpenPipeStream intercepted for Android (locale -a stub).
++ * pg_flush_data() change (fsync instead of sync_file_range) is inherited from WASM.
+  */
+
+ /* At top of fd.c, before first #include */
+ #define PG_FD
+
+ /* In OpenPipeStream(): */
+-#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__) && !defined(__ANDROID_PGANDROID__)
+     return popen(command, type);
+ #else
+     return android_OpenPipeStream(command, type);
+ #endif
+diff --git a/src/include/storage/fd.h b/src/include/storage/fd.h
+--- a/src/include/storage/fd.h
++++ b/src/include/storage/fd.h
+@@ -1,5 +1,8 @@
+ /*
+  * src/include/storage/fd.h
++ *
++ * PATCH 001 (pgandroid): Rename fsync_fname/durable_rename to avoid
++ * conflicts with common/file_utils.h in combined link unit.
+  */
+
+-#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++#if defined(__EMSCRIPTEN__) || defined(__wasi__) || defined(__ANDROID_PGANDROID__)
+ #define fsync_fname(fname, isdir)       fd_fsync_fname((fname), (isdir))
+ #define durable_rename(oldfile, newfile, loglevel) \
+     fd_durable_rename((oldfile), (newfile), (loglevel))
+diff --git a/src/include/storage/ipc.h b/src/include/storage/ipc.h
+--- a/src/include/storage/ipc.h
++++ b/src/include/storage/ipc.h
+@@ -1,5 +1,9 @@
+ /*
+  * src/include/storage/ipc.h
++ *
++ * PATCH 001 (pgandroid): proc_exit declared without pg_attribute_noreturn()
++ * when __ANDROID_PGANDROID__, because pg_proc_exit() returns (does not exit).
++ * The proc_exit -> pg_proc_exit rename is done in android_pgandroid.h.
+  */
+
+-#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++#if defined(__EMSCRIPTEN__) || defined(__wasi__) || defined(__ANDROID_PGANDROID__)
+ extern void pg_proc_exit(int code);
+ /* proc_exit renamed to pg_proc_exit via macro in wasm_common.h / android_pgandroid.h */
+ #else
+diff --git a/src/include/utils/palloc.h b/src/include/utils/palloc.h
+--- a/src/include/utils/palloc.h
++++ b/src/include/utils/palloc.h
+@@ -1,5 +1,8 @@
+ /*
+  * src/include/utils/palloc.h
++ *
++ * PATCH 001 (pgandroid): Guard extern declarations to avoid duplicate symbols
++ * in combined frontend+backend link unit.
+  */
+
+-#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__) && !defined(__ANDROID_PGANDROID__)
+ #if !defined(PG_EXTERN)
+ extern MemoryContext CurrentMemoryContext;
+ #endif
+diff --git a/src/port/getpeereid.c b/src/port/getpeereid.c
+--- a/src/port/getpeereid.c
++++ b/src/port/getpeereid.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/port/getpeereid.c
++ *
++ * PATCH 001 (pgandroid): Stub getpeereid() — in JNI mode client and server
++ * are the same process; peer credentials are irrelevant.
+  */
+
+-#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++#if defined(__EMSCRIPTEN__) || defined(__wasi__) || defined(__ANDROID_PGANDROID__)
+ int
+ getpeereid(int sock, uid_t *uid, gid_t *gid)
+ {
+diff --git a/src/interfaces/libpq/legacy-pqsignal.c b/src/interfaces/libpq/legacy-pqsignal.c
+--- a/src/interfaces/libpq/legacy-pqsignal.c
++++ b/src/interfaces/libpq/legacy-pqsignal.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/interfaces/libpq/legacy-pqsignal.c
++ *
++ * PATCH 001 (pgandroid): Skip pqsignal() wrapper — signal handling not used
++ * in single-process embedded JNI mode.
+  */
+
+-#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__) && !defined(__ANDROID_PGANDROID__)
+ pqsigfunc
+ pqsignal(int signo, pqsigfunc func)
+ {
+diff --git a/src/common/pg_get_line.c b/src/common/pg_get_line.c
+--- a/src/common/pg_get_line.c
++++ b/src/common/pg_get_line.c
+@@ -1,5 +1,8 @@
+ /*
+  * src/common/pg_get_line.c
++ *
++ * PATCH 001 (pgandroid): sigsetjmp wrapper skipped — Android bionic supports
++ * it, but in embedded single-line input mode it is not required.
+  */
+
+-#if !defined(__wasi__)
++#if !defined(__wasi__) && !defined(__ANDROID_PGANDROID__)
+     if (sigsetjmp(local_sigjmp_buf, 1) != 0) { ... }
+ #endif
