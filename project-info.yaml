@@ -1,0 +1,57 @@
+name: pgAndroid
+description: >
+  Native PostgreSQL embedded library for Android. Compiles PostgreSQL 17.5 as a
+  single-process, single-connection native .so using PGlite's single-process patches
+  and Android NDK. Enables Android apps to run full PL/pgSQL functions locally
+  without any server, giving mobile apps the same SQL dialect as their server backend.
+
+organization: progalaxyelabs
+license: PostgreSQL
+repository: https://github.com/progalaxyelabs/pgandroid
+
+tech_stack:
+  language: C (PostgreSQL core), Kotlin (JNI bridge), Java (JNI interface)
+  build_system: GNU Autotools (configure/make) + Android NDK toolchain
+  target_platform: Android (API 29+, Android 10+)
+  target_architectures:
+    - aarch64 (arm64-v8a) - primary, covers 95%+ of modern Android devices
+    - x86_64 - for emulator testing only
+  postgresql_version: "17.5"
+  upstream_fork: electric-sql/postgres-pglite (REL_17_5_WASM branch)
+
+dependencies:
+  build_time:
+    - android-ndk: ">=r27"
+    - autoconf: ">=2.69"
+    - make: ">=4.0"
+    - git: ">=2.0"
+  bundled:
+    - openssl: "3.x (cross-compiled for aarch64, needed by pgcrypto)"
+  optional:
+    - android-sdk: "for building test APK only"
+    - gradle: "8.x (for test APK only)"
+
+extensions:
+  included:
+    - pgcrypto: "gen_random_uuid(), crypt(), pgp_sym_encrypt()"
+    - uuid-ossp: "uuid_generate_v4()"
+  planned:
+    - pg_trgm: "fuzzy text search (medicine name matching)"
+
+paths:
+  project_root: /ssd2/projects/progalaxy-elabs/divisions/opensource/pgandroid
+  android_sdk: /hdd1/android-dev/sdk
+  android_ndk: /hdd1/android-dev/sdk/ndk/27.2.12479018
+
+artifacts:
+  primary: libpgandroid.so
+  headers: pgandroid.h
+  jni_bridge: pgandroid-jni.aar (Android Archive)
+
+target_use_case: >
+  Medical store billing app (medstoreapp) offline mode. 5000 products,
+  500 invoices/month, 79 PL/pgSQL functions running natively on phone.
+  Single-user, single-connection. No auth, no network required.
+
+status: planning
+created: 2026-02-22
