@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+*.o
+*.so
+*.a
+*.out
+
+# NDK / SDK (installed on host, not in repo)
+ndk/
+sdk/
+
+# Android build outputs
+*.apk
+*.aab
+*.dex
+
+# Local env overrides
+.env
