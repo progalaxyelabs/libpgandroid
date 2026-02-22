@@ -456,7 +456,9 @@ done
 
 echo "[pgandroid] Frontend support objects: $FE_OBJS"
 
-PGANDROID_ENTRY_OBJS=$(find "$OUT_DIR" -name 'pgandroid_*.o' ! -name 'pgandroid_jni.o' 2>/dev/null | tr '\n' ' ')
+# Collect pgandroid entry-point objects: pgandroid_main.o, pgandroid_io.o only
+# (pgandroid_initdb.o is linked separately as $INITDB_OBJ; jni object is $JNI_BRIDGE_OBJ)
+PGANDROID_ENTRY_OBJS=$(find "$OUT_DIR" -name 'pgandroid_main.o' -o -name 'pgandroid_io.o' 2>/dev/null | tr '\n' ' ')
 echo "[pgandroid] Entry-point objects: $PGANDROID_ENTRY_OBJS"
 
 # ---------------------------------------------------------------------------
