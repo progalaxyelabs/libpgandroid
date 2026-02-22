@@ -16,3 +16,6 @@ sdk/
 
 # Local env overrides
 .env
+
+# Upstream PostgreSQL source (cloned for analysis, not committed)
+upstream/

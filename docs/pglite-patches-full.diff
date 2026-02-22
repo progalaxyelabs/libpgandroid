@@ -1,0 +1,3878 @@
+diff --git a/contrib/pgstattuple/pgstatindex.c b/contrib/pgstattuple/pgstatindex.c
+index 5c06ba6db4..0ea74cef43 100644
+--- a/contrib/pgstattuple/pgstatindex.c
++++ b/contrib/pgstattuple/pgstatindex.c
+@@ -656,9 +656,9 @@ pgstathashindex(PG_FUNCTION_ARGS)
+ 			stats.unused_pages++;
+ 		else if (PageGetSpecialSize(page) !=
+ 				 MAXALIGN(sizeof(HashPageOpaqueData)))
+-			ereport(ERROR,
++			ereport(WARNING,
+ 					(errcode(ERRCODE_INDEX_CORRUPTED),
+-					 errmsg("index \"%s\" contains corrupted page at block %u",
++					 errmsg("# 661(FATAL block=%d): index \"%s\" contains corrupted page at block %u", blkno,
+ 							RelationGetRelationName(rel),
+ 							BufferGetBlockNumber(buf))));
+ 		else
+diff --git a/contrib/xml2/Makefile b/contrib/xml2/Makefile
+index 0d703fe0e8..926649f63d 100644
+--- a/contrib/xml2/Makefile
++++ b/contrib/xml2/Makefile
+@@ -11,7 +11,7 @@ DATA = xml2--1.1.sql xml2--1.0--1.1.sql
+ PGFILEDESC = "xml2 - XPath querying and XSLT"
+ 
+ REGRESS = xml2
+-
++PG_CFLAGS=$(shell xml2-config --cflags)
+ SHLIB_LINK += $(filter -lxslt, $(LIBS)) -lxml2
+ 
+ ifdef USE_PGXS
+diff --git a/src/backend/Makefile b/src/backend/Makefile
+index 84302cc6da..dbc1d4a148 100644
+--- a/src/backend/Makefile
++++ b/src/backend/Makefile
+@@ -37,9 +37,11 @@ LOCALOBJS += utils/probes.o
+ endif
+ endif
+ 
+-OBJS = \
++ONLYOBJS = \
+ 	$(LOCALOBJS) \
+-	$(SUBDIROBJS) \
++	$(SUBDIROBJS)
++OBJS = \
++	$(ONLYOBJS) \
+ 	$(top_builddir)/src/common/libpgcommon_srv.a \
+ 	$(top_builddir)/src/port/libpgport_srv.a
+ 
+@@ -60,6 +62,7 @@ override LDFLAGS := $(LDFLAGS) $(LDFLAGS_EX) $(LDFLAGS_EX_BE)
+ 
+ all: submake-libpgport submake-catalog-headers submake-utils-headers postgres $(POSTGRES_IMP)
+ 
++ifneq ($(PORTNAME), emscripten)
+ ifneq ($(PORTNAME), cygwin)
+ ifneq ($(PORTNAME), win32)
+ 
+@@ -68,6 +71,37 @@ postgres: $(OBJS)
+ 
+ endif
+ endif
++endif
++
++ifeq ($(PORTNAME), emscripten)
++AR ?= llvm-ar
++LIBPGCORE ?= $(top_builddir)/libpgcore.a
++LIBPG = $(top_builddir)/libpostgres.a
++PGCORE = $(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/port/libpgport_srv.a $(LIBPG)
++PGMAIN = main/main.o tcop/postgres.o
++postgres: $(OBJS)
++	$(AR) rcs $(top_builddir)/libpgmain.a $(PGMAIN)
++	$(AR) rcs $(LIBPG) $(filter-out $(PGMAIN),$(call expand_subsys,$(ONLYOBJS)))
++	$(CC) -r -o $(top_builddir)/libpgcore.o -Wl,--whole-archive $(PGCORE)
++	$(AR) rcs $(LIBPGCORE) $(top_builddir)/libpgcore.o
++	COPTS="$(LOPTS)" $(CC) $(MAIN_MODULE) $(CFLAGS) $(LDFLAGS) -o $@ $(LIBPGCORE) $(top_builddir)/libpgmain.a $(LIBS)
++endif
++
++ifeq ($(PORTNAME), wasi)
++AR ?= llvm-ar
++LIBPGCORE ?= $(top_builddir)/libpgcore.a
++LIBPG = $(top_builddir)/libpostgres.a
++PGCORE = $(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/port/libpgport_srv.a $(LIBPG)
++PGMAIN = main/main.o tcop/postgres.o
++postgres: $(OBJS)
++	$(AR) rcs $(top_builddir)/libpgmain.a $(PGMAIN)
++	$(AR) rcs $(LIBPG) $(filter-out $(PGMAIN),$(call expand_subsys,$(ONLYOBJS)))
++	$(CC) -r -o $(top_builddir)/libpgcore.o -Wl,--whole-archive $(PGCORE)
++	$(AR) rcs $(LIBPGCORE) $(top_builddir)/libpgcore.o
++	COPTS="$(LOPTS)" $(CC) $(MAIN_MODULE) $(CFLAGS) $(LDFLAGS) -nostartfiles -o $@ $(LIBPGCORE) $(top_builddir)/libpgmain.a $(LIBS)
++	mv $@ $@.wasi
++	touch $@
++endif
+ 
+ ifeq ($(PORTNAME), cygwin)
+ 
+diff --git a/src/backend/access/nbtree/nbtutils.c b/src/backend/access/nbtree/nbtutils.c
+index 878f4b2e7b..5c5061fbc7 100644
+--- a/src/backend/access/nbtree/nbtutils.c
++++ b/src/backend/access/nbtree/nbtutils.c
+@@ -5163,7 +5163,7 @@ _bt_allequalimage(Relation rel, bool debugmessage)
+ 			break;
+ 		}
+ 	}
+-
++#if !defined(__EMSCRIPTEN__)
+ 	if (debugmessage)
+ 	{
+ 		if (allequalimage)
+@@ -5173,6 +5173,6 @@ _bt_allequalimage(Relation rel, bool debugmessage)
+ 			elog(DEBUG1, "index \"%s\" cannot use deduplication",
+ 				 RelationGetRelationName(rel));
+ 	}
+-
++#endif
+ 	return allequalimage;
+ }
+diff --git a/src/backend/access/transam/xact.c b/src/backend/access/transam/xact.c
+index 4cecf63006..1c9dfc1018 100644
+--- a/src/backend/access/transam/xact.c
++++ b/src/backend/access/transam/xact.c
+@@ -1761,6 +1761,7 @@ RecordTransactionAbort(bool isSubXact)
+ 	if (TransactionIdDidCommit(xid))
+ 		elog(PANIC, "cannot abort transaction %u, it was already committed",
+ 			 xid);
++	else elog(WARNING, "# 1743: aborting transaction %u", xid);
+ 
+ 	/*
+ 	 * Are we using the replication origins feature?  Or, in other words, are
+@@ -2804,7 +2805,9 @@ AbortTransaction(void)
+ 	 * handler.  We do this fairly early in the sequence so that the timeout
+ 	 * infrastructure will be functional if needed while aborting.
+ 	 */
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ 	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
++#endif
+ 
+ 	/*
+ 	 * check the current transaction state
+@@ -5211,7 +5214,10 @@ AbortSubTransaction(void)
+ 	 * handler.  We do this fairly early in the sequence so that the timeout
+ 	 * infrastructure will be functional if needed while aborting.
+ 	 */
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ 	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
++#endif
++
+ 
+ 	/*
+ 	 * check the current transaction state
+diff --git a/src/backend/access/transam/xlogarchive.c b/src/backend/access/transam/xlogarchive.c
+index 81999b4820..8e3b1f04c1 100644
+--- a/src/backend/access/transam/xlogarchive.c
++++ b/src/backend/access/transam/xlogarchive.c
+@@ -32,6 +32,10 @@
+ #include "storage/fd.h"
+ #include "storage/ipc.h"
+ 
++#if defined(__wasi__)
++#define system(cmd) system_wasi(cmd)
++#endif
++
+ /*
+  * Attempt to retrieve the specified file from off-line archival storage.
+  * If successful, fill "path" with its complete path (note that this will be
+diff --git a/src/backend/bootstrap/bootstrap.c b/src/backend/bootstrap/bootstrap.c
+index 986f6f1d9c..8b226b212f 100644
+--- a/src/backend/bootstrap/bootstrap.c
++++ b/src/backend/bootstrap/bootstrap.c
+@@ -195,7 +195,11 @@ CheckerModeMain(void)
+  *	 to shared memory sizing, options work (or at least do not cause an error
+  *	 up to shared memory creation).
+  */
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ void
++#else
++int
++#endif
+ BootstrapModeMain(int argc, char *argv[], bool check_only)
+ {
+ 	int			i;
+@@ -365,7 +369,12 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
+ 
+ 	/* Clean up and exit */
+ 	cleanup();
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ 	proc_exit(0);
++#else
++	puts("# 338 cleanup(boot): " __FILE__);
++	return 0;
++#endif
+ }
+ 
+ 
+diff --git a/src/backend/catalog/index.c b/src/backend/catalog/index.c
+index abd8eef086..225be70358 100644
+--- a/src/backend/catalog/index.c
++++ b/src/backend/catalog/index.c
+@@ -2967,7 +2967,7 @@ index_build(Relation heapRelation,
+ 		indexInfo->ii_ParallelWorkers =
+ 			plan_create_index_workers(RelationGetRelid(heapRelation),
+ 									  RelationGetRelid(indexRelation));
+-
++#if !defined(__EMSCRIPTEN__)
+ 	if (indexInfo->ii_ParallelWorkers == 0)
+ 		ereport(DEBUG1,
+ 				(errmsg_internal("building index \"%s\" on table \"%s\" serially",
+@@ -2979,7 +2979,7 @@ index_build(Relation heapRelation,
+ 								 RelationGetRelationName(indexRelation),
+ 								 RelationGetRelationName(heapRelation),
+ 								 indexInfo->ii_ParallelWorkers)));
+-
++#endif
+ 	/*
+ 	 * Switch to the table owner's userid, so that any index functions are run
+ 	 * as that user.  Also lock down security-restricted operations and
+diff --git a/src/backend/commands/collationcmds.c b/src/backend/commands/collationcmds.c
+index 63ef9a0841..3167e66ac6 100644
+--- a/src/backend/commands/collationcmds.c
++++ b/src/backend/commands/collationcmds.c
+@@ -868,14 +868,14 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
+ 		maxaliases = 100;
+ 		aliases = (CollAliasData *) palloc(maxaliases * sizeof(CollAliasData));
+ 		naliases = 0;
+-
+ 		locale_a_handle = OpenPipeStream("locale -a", "r");
+-		if (locale_a_handle == NULL)
++		if (locale_a_handle == NULL) {
++            puts("======================== ERROR ================");
+ 			ereport(ERROR,
+ 					(errcode_for_file_access(),
+ 					 errmsg("could not execute command \"%s\": %m",
+ 							"locale -a")));
+-
++        }
+ 		while (fgets(localebuf, sizeof(localebuf), locale_a_handle))
+ 		{
+ 			size_t		len;
+diff --git a/src/backend/commands/dbcommands.c b/src/backend/commands/dbcommands.c
+index 2505b3084b..9db4495fac 100644
+--- a/src/backend/commands/dbcommands.c
++++ b/src/backend/commands/dbcommands.c
+@@ -1834,8 +1834,9 @@ dropdb(const char *dbname, bool missing_ok, bool force)
+ 	RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
+ 
+ 	/* Close all smgr fds in all backends. */
++#if !defined(__wasi__) && !defined(__EMSCRIPTEN__)
+ 	WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
+-
++#endif
+ 	/*
+ 	 * Remove all tablespace subdirs belonging to the database.
+ 	 */
+diff --git a/src/backend/commands/event_trigger.c b/src/backend/commands/event_trigger.c
+index 05a6de68ba..a84cf281c5 100644
+--- a/src/backend/commands/event_trigger.c
++++ b/src/backend/commands/event_trigger.c
+@@ -723,6 +723,7 @@ EventTriggerDDLCommandStart(Node *parsetree)
+ 	List	   *runlist;
+ 	EventTriggerData trigdata;
+ 
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ 	/*
+ 	 * Event Triggers are completely disabled in standalone mode.  There are
+ 	 * (at least) two reasons for this:
+@@ -744,6 +745,10 @@ EventTriggerDDLCommandStart(Node *parsetree)
+ 	 */
+ 	if (!IsUnderPostmaster || !event_triggers)
+ 		return;
++#else
++	if (!event_triggers)
++		return;
++#endif
+ 
+ 	runlist = EventTriggerCommonSetup(parsetree,
+ 									  EVT_DDLCommandStart,
+@@ -773,14 +778,17 @@ EventTriggerDDLCommandEnd(Node *parsetree)
+ {
+ 	List	   *runlist;
+ 	EventTriggerData trigdata;
+-
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ 	/*
+ 	 * See EventTriggerDDLCommandStart for a discussion about why event
+ 	 * triggers are disabled in single user mode or via GUC.
+ 	 */
+ 	if (!IsUnderPostmaster || !event_triggers)
+ 		return;
+-
++#else
++	if (!event_triggers)
++		return;
++#endif
+ 	/*
+ 	 * Also do nothing if our state isn't set up, which it won't be if there
+ 	 * weren't any relevant event triggers at the start of the current DDL
+@@ -821,14 +829,17 @@ EventTriggerSQLDrop(Node *parsetree)
+ {
+ 	List	   *runlist;
+ 	EventTriggerData trigdata;
+-
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ 	/*
+ 	 * See EventTriggerDDLCommandStart for a discussion about why event
+ 	 * triggers are disabled in single user mode or via a GUC.
+ 	 */
+ 	if (!IsUnderPostmaster || !event_triggers)
+ 		return;
+-
++#else
++	if (!event_triggers)
++		return;
++#endif
+ 	/*
+ 	 * Use current state to determine whether this event fires at all.  If
+ 	 * there are no triggers for the sql_drop event, then we don't have
+@@ -894,7 +905,7 @@ EventTriggerOnLogin(void)
+ {
+ 	List	   *runlist;
+ 	EventTriggerData trigdata;
+-
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ 	/*
+ 	 * See EventTriggerDDLCommandStart for a discussion about why event
+ 	 * triggers are disabled in single user mode or via a GUC.  We also need a
+@@ -903,7 +914,10 @@ EventTriggerOnLogin(void)
+ 	if (!IsUnderPostmaster || !event_triggers ||
+ 		!OidIsValid(MyDatabaseId) || !MyDatabaseHasLoginEventTriggers)
+ 		return;
+-
++#else
++	if (!event_triggers || !OidIsValid(MyDatabaseId) || !MyDatabaseHasLoginEventTriggers)
++		return;
++#endif
+ 	StartTransactionCommand();
+ 	runlist = EventTriggerCommonSetup(NULL,
+ 									  EVT_Login, "login",
+@@ -1005,14 +1019,17 @@ EventTriggerTableRewrite(Node *parsetree, Oid tableOid, int reason)
+ {
+ 	List	   *runlist;
+ 	EventTriggerData trigdata;
+-
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ 	/*
+ 	 * See EventTriggerDDLCommandStart for a discussion about why event
+ 	 * triggers are disabled in single user mode or via a GUC.
+ 	 */
+ 	if (!IsUnderPostmaster || !event_triggers)
+ 		return;
+-
++#else
++	if (!event_triggers)
++		return;
++#endif
+ 	/*
+ 	 * Also do nothing if our state isn't set up, which it won't be if there
+ 	 * weren't any relevant event triggers at the start of the current DDL
+diff --git a/src/backend/libpq/auth.c b/src/backend/libpq/auth.c
+index 2b607c5270..4ae4ed67a3 100644
+--- a/src/backend/libpq/auth.c
++++ b/src/backend/libpq/auth.c
+@@ -1856,7 +1856,7 @@ auth_peer(hbaPort *port)
+ {
+ 	uid_t		uid;
+ 	gid_t		gid;
+-#ifndef WIN32
++#if !defined(WIN32) && !defined(__wasi__)
+ 	struct passwd *pw;
+ 	int			ret;
+ #endif
+@@ -1875,7 +1875,7 @@ auth_peer(hbaPort *port)
+ 		return STATUS_ERROR;
+ 	}
+ 
+-#ifndef WIN32
++#if !defined(WIN32) && !defined(__wasi__)
+ 	errno = 0;					/* clear errno before call */
+ 	pw = getpwuid(uid);
+ 	if (!pw)
+diff --git a/src/backend/libpq/be-fsstubs.c b/src/backend/libpq/be-fsstubs.c
+index 27d317dfdc..afc579fd20 100644
+--- a/src/backend/libpq/be-fsstubs.c
++++ b/src/backend/libpq/be-fsstubs.c
+@@ -150,8 +150,12 @@ be_lo_close(PG_FUNCTION_ARGS)
+  *
+  *****************************************************************************/
+ 
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++static int
++#else
+ int
+-lo_read(int fd, char *buf, int len)
++#endif
++lo_read3(int fd, char *buf, int len)
+ {
+ 	int			status;
+ 	LargeObjectDesc *lobj;
+@@ -178,8 +182,12 @@ lo_read(int fd, char *buf, int len)
+ 	return status;
+ }
+ 
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++static int
++#else
+ int
+-lo_write(int fd, const char *buf, int len)
++#endif
++lo_write3(int fd, const char *buf, int len)
+ {
+ 	int			status;
+ 	LargeObjectDesc *lobj;
+@@ -190,7 +198,7 @@ lo_write(int fd, const char *buf, int len)
+ 				 errmsg("invalid large-object descriptor: %d", fd)));
+ 	lobj = cookies[fd];
+ 
+-	/* see comment in lo_read() */
++	/* see comment in lo_read3() */
+ 	if ((lobj->flags & IFS_WRLOCK) == 0)
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+@@ -365,7 +373,7 @@ be_loread(PG_FUNCTION_ARGS)
+ 		len = 0;
+ 
+ 	retval = (bytea *) palloc(VARHDRSZ + len);
+-	totalread = lo_read(fd, VARDATA(retval), len);
++	totalread = lo_read3(fd, VARDATA(retval), len);
+ 	SET_VARSIZE(retval, totalread + VARHDRSZ);
+ 
+ 	PG_RETURN_BYTEA_P(retval);
+@@ -382,7 +390,7 @@ be_lowrite(PG_FUNCTION_ARGS)
+ 	PreventCommandIfReadOnly("lowrite()");
+ 
+ 	bytestowrite = VARSIZE_ANY_EXHDR(wbuf);
+-	totalwritten = lo_write(fd, VARDATA_ANY(wbuf), bytestowrite);
++	totalwritten = lo_write3(fd, VARDATA_ANY(wbuf), bytestowrite);
+ 	PG_RETURN_INT32(totalwritten);
+ }
+ 
+@@ -560,7 +568,7 @@ lo_truncate_internal(int32 fd, int64 len)
+ 				 errmsg("invalid large-object descriptor: %d", fd)));
+ 	lobj = cookies[fd];
+ 
+-	/* see comment in lo_read() */
++	/* see comment in lo_read3() */
+ 	if ((lobj->flags & IFS_WRLOCK) == 0)
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+diff --git a/src/backend/libpq/pqcomm.c b/src/backend/libpq/pqcomm.c
+index daa0696146..90f2216697 100644
+--- a/src/backend/libpq/pqcomm.c
++++ b/src/backend/libpq/pqcomm.c
+@@ -122,10 +122,16 @@ static char *PqSendBuffer;
+ static int	PqSendBufferSize;	/* Size send buffer */
+ static size_t PqSendPointer;	/* Next index to store a byte in PqSendBuffer */
+ static size_t PqSendStart;		/* Next index to send a byte in PqSendBuffer */
+-
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ static char PqRecvBuffer[PQ_RECV_BUFFER_SIZE];
+ static int	PqRecvPointer;		/* Next index to read a byte from PqRecvBuffer */
+ static int	PqRecvLength;		/* End of data available in PqRecvBuffer */
++#else
++static char PqRecvBuffer_static[PQ_RECV_BUFFER_SIZE];
++static char *PqRecvBuffer;
++static int	PqRecvPointer;
++static int	PqRecvLength;
++#endif
+ 
+ /*
+  * Message status
+@@ -135,6 +141,7 @@ static bool PqCommReadingMsg;	/* in the middle of reading a message */
+ 
+ 
+ /* Internal functions */
++
+ static void socket_comm_reset(void);
+ static void socket_close(int code, Datum arg);
+ static void socket_set_nonblocking(bool nonblocking);
+@@ -148,9 +155,6 @@ static inline int internal_flush(void);
+ static pg_noinline int internal_flush_buffer(const char *buf, size_t *start,
+ 											 size_t *end);
+ 
+-static int	Lock_AF_UNIX(const char *unixSocketDir, const char *unixSocketPath);
+-static int	Setup_AF_UNIX(const char *sock_path);
+-
+ static const PQcommMethods PqCommSocketMethods = {
+ 	.comm_reset = socket_comm_reset,
+ 	.flush = socket_flush,
+@@ -160,6 +164,10 @@ static const PQcommMethods PqCommSocketMethods = {
+ 	.putmessage_noblock = socket_putmessage_noblock
+ };
+ 
++static int	Lock_AF_UNIX(const char *unixSocketDir, const char *unixSocketPath);
++static int	Setup_AF_UNIX(const char *sock_path);
++
++
+ const PQcommMethods *PqCommMethods = &PqCommSocketMethods;
+ 
+ WaitEventSet *FeBeWaitSet;
+@@ -181,7 +189,7 @@ pq_init(ClientSocket *client_sock)
+ 	port->sock = client_sock->sock;
+ 	memcpy(&port->raddr.addr, &client_sock->raddr.addr, client_sock->raddr.salen);
+ 	port->raddr.salen = client_sock->raddr.salen;
+-
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ 	/* fill in the server (local) address */
+ 	port->laddr.salen = sizeof(port->laddr.addr);
+ 	if (getsockname(port->sock,
+@@ -273,6 +281,7 @@ pq_init(ClientSocket *client_sock)
+ 		(void) pq_setkeepalivescount(tcp_keepalives_count, port);
+ 		(void) pq_settcpusertimeout(tcp_user_timeout, port);
+ 	}
++#endif /* WASM */
+ 
+ 	/* initialize state variables */
+ 	PqSendBufferSize = PQ_SEND_BUFFER_SIZE;
+@@ -280,7 +289,7 @@ pq_init(ClientSocket *client_sock)
+ 	PqSendPointer = PqSendStart = PqRecvPointer = PqRecvLength = 0;
+ 	PqCommBusy = false;
+ 	PqCommReadingMsg = false;
+-
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ 	/* set up process-exit hook to close the socket */
+ 	on_proc_exit(socket_close, 0);
+ 
+@@ -310,7 +319,12 @@ pq_init(ClientSocket *client_sock)
+ 								  MyLatch, NULL);
+ 	AddWaitEventToSet(FeBeWaitSet, WL_POSTMASTER_DEATH, PGINVALID_SOCKET,
+ 					  NULL, NULL);
+-
++#else /* WASM */
++    PDEBUG("# 220: FIXME: socketfile");
++    #pragma message "FIXME: socketfile"
++    /* because we fill before starting reading message */
++    PqRecvBuffer = &PqRecvBuffer_static[0];
++#endif /* WASM */
+ 	/*
+ 	 * The event positions match the order we added them, but let's sanity
+ 	 * check them to be sure.
+@@ -730,7 +744,7 @@ Setup_AF_UNIX(const char *sock_path)
+ 	Assert(Unix_socket_group);
+ 	if (Unix_socket_group[0] != '\0')
+ 	{
+-#ifdef WIN32
++#if defined(WIN32) || defined(__wasi__)
+ 		elog(WARNING, "configuration item \"unix_socket_group\" is not supported on this platform");
+ #else
+ 		char	   *endptr;
+@@ -1136,6 +1150,20 @@ pq_buffer_remaining_data(void)
+  *		This must be called before any of the pq_get* functions.
+  * --------------------------------
+  */
++#if defined(I_EMSCRIPTEN) || defined(I_WASI)
++EMSCRIPTEN_KEEPALIVE void
++pq_recvbuf_fill(FILE* fp, int packetlen) {
++    fread( PqRecvBuffer, packetlen, 1, fp);
++    PqRecvPointer = 0;
++    PqRecvLength = packetlen;
++#if PDEBUG
++        printf("# 1199: pq_recvbuf_fill cma_rsize=%d PqRecvLength=%d buf=%p reply=%p\n", cma_rsize, PqRecvLength, &PqRecvBuffer[0], &PqSendBuffer[0]);
++#endif
++
++}
++#endif
++extern int cma_rsize;
++static char * PqSendBuffer_save;
+ void
+ pq_startmsgread(void)
+ {
+@@ -1147,7 +1175,29 @@ pq_startmsgread(void)
+ 		ereport(FATAL,
+ 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+ 				 errmsg("terminating connection because protocol synchronization was lost")));
++#if defined(I_EMSCRIPTEN) || defined(I_WASI)
++    if (!pq_buffer_remaining_data()) {
++        if (cma_rsize) {
++            PqRecvPointer = 0;
++            PqRecvLength = cma_rsize;
++            PqRecvBuffer = (char*)0x1;
++
++            PqSendPointer = 0;
++            PqSendBuffer_save = PqSendBuffer;
++            PqSendBuffer = 2 + (char*)(cma_rsize);
++            PqSendBufferSize = (CMA_MB*1024*1024) - (int)(&PqSendBuffer[0]);
++        } else {
++            PqRecvBuffer = &PqRecvBuffer_static[0];
++            if (PqSendBuffer_save)
++                PqSendBuffer=PqSendBuffer_save;
++            PqSendBufferSize = PQ_SEND_BUFFER_SIZE;
++        }
++    }
++#if PDEBUG
++        printf("# 1199: pq_startmsgread cma_rsize=%d PqRecvLength=%d buf=%p reply=%p\n", cma_rsize, PqRecvLength, &PqRecvBuffer[0], &PqSendBuffer[0]);
++#endif
+ 
++#endif
+ 	PqCommReadingMsg = true;
+ }
+ 
+@@ -1270,7 +1320,55 @@ pq_getmessage(StringInfo s, int maxlen)
+ 
+ 	return 0;
+ }
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++extern FILE* SOCKET_FILE;
++extern int SOCKET_DATA;
++static int
++internal_putbytes(const char *s, size_t len) {
++	if (PqSendPointer >= PqSendBufferSize) {
++        fprintf(stderr, "# 1329: overflow %d >= %d cma_rsize=%d CMA=%d\n", PqSendPointer, PqSendBufferSize,cma_rsize, CMA_MB);
++    }
++
++    if (!cma_rsize) {
++        int wc=      fwrite(s, 1, len, SOCKET_FILE);
++        SOCKET_DATA+=wc;
++    } else {
++	    size_t		amount;
++	    while (len > 0) {
++		    /* If buffer is full, then flush it out */
++		    if (PqSendPointer >= PqSendBufferSize) {
++			    socket_set_nonblocking(false);
++			    if (internal_flush())
++				    return EOF;
++		    }
++		    amount = PqSendBufferSize - PqSendPointer;
++		    if (amount > len)
++			    amount = len;
++		    memcpy(PqSendBuffer + PqSendPointer, s, amount);
++		    PqSendPointer += amount;
++		    s += amount;
++		    len -= amount;
++            SOCKET_DATA+=amount;
++	    }
++    }
++    return 0;
++}
++
++static int
++socket_flush(void) {
++    return internal_flush();
++}
++
++static int
++internal_flush(void) {
++    /*  no flush for raw wire */
++    if (!cma_rsize) {
++    	PqSendStart = PqSendPointer = 0;
++    }
++	return 0;
++}
+ 
++#else
+ 
+ static inline int
+ internal_putbytes(const char *s, size_t len)
+@@ -1421,7 +1519,7 @@ internal_flush_buffer(const char *buf, size_t *start, size_t *end)
+ 	*start = *end = 0;
+ 	return 0;
+ }
+-
++#endif /* wasm */
+ /* --------------------------------
+  *		pq_flush_if_writable - flush pending output if writable without blocking
+  *
+diff --git a/src/backend/port/posix_sema.c b/src/backend/port/posix_sema.c
+index 5886d2233f..f7d5e2b200 100644
+--- a/src/backend/port/posix_sema.c
++++ b/src/backend/port/posix_sema.c
+@@ -298,10 +298,16 @@ PGSemaphoreReset(PGSemaphore sema)
+ 	 * There's no direct API for this in POSIX, so we have to ratchet the
+ 	 * semaphore down to 0 with repeated trywait's.
+ 	 */
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++    sem_trywait(PG_SEM_REF(sema));
++    return;
++#else
+ 	for (;;)
+ 	{
+ 		if (sem_trywait(PG_SEM_REF(sema)) < 0)
+ 		{
++
++
+ 			if (errno == EAGAIN || errno == EDEADLK)
+ 				break;			/* got it down to 0 */
+ 			if (errno == EINTR)
+@@ -309,6 +315,7 @@ PGSemaphoreReset(PGSemaphore sema)
+ 			elog(FATAL, "sem_trywait failed: %m");
+ 		}
+ 	}
++#endif
+ }
+ 
+ /*
+diff --git a/src/backend/port/sysv_shmem.c b/src/backend/port/sysv_shmem.c
+index 362a37d3b3..c11f963ab6 100644
+--- a/src/backend/port/sysv_shmem.c
++++ b/src/backend/port/sysv_shmem.c
+@@ -17,8 +17,8 @@
+  *
+  *-------------------------------------------------------------------------
+  */
++#define PG_SHMEM
+ #include "postgres.h"
+-
+ #include <signal.h>
+ #include <unistd.h>
+ #include <sys/file.h>
+@@ -700,12 +700,47 @@ PGShmemHeader *
+ PGSharedMemoryCreate(Size size,
+ 					 PGShmemHeader **shim)
+ {
+-	IpcMemoryKey NextShmemSegID;
+-	void	   *memAddress;
++	IpcMemoryKey NextShmemSegID = 0;
++	void	   *memAddress = NULL;
+ 	PGShmemHeader *hdr;
+ 	struct stat statbuf;
+ 	Size		sysvsize;
+ 
++/*
++    puts("@\n@\n@\n@\n@\n@\n PGSharedMemoryCreate @\n@\n@\n@\n@\n@\n");
++
++	elog(NOTICE, "Init WASM shared memory");
++
++	hdr = (PGShmemHeader *) malloc(size);
++	hdr->creatorPID = getpid();
++	hdr->magic = PGShmemMagic;
++	hdr->dsm_control = 0;
++
++
++	hdr->device = statbuf.st_dev;
++	hdr->inode = statbuf.st_ino;
++
++	hdr->totalsize = size;
++	hdr->freeoffset = MAXALIGN(sizeof(PGShmemHeader));
++	*shim = hdr;
++
++	UsedShmemSegAddr = memAddress;
++	UsedShmemSegID = (unsigned long) NextShmemSegID;
++
++	if (AnonymousShmem == NULL)
++		return hdr;
++	memcpy(AnonymousShmem, hdr, sizeof(PGShmemHeader));
++	return (PGShmemHeader *) AnonymousShmem;
++*/
++
++
++
++
++
++
++
++
++
+ 	/*
+ 	 * We use the data directory's ID info (inode and device numbers) to
+ 	 * positively identify shmem segments associated with this data dir, and
+diff --git a/src/backend/postmaster/checkpointer.c b/src/backend/postmaster/checkpointer.c
+index 199f008bcd..f8e3f4ed10 100644
+--- a/src/backend/postmaster/checkpointer.c
++++ b/src/backend/postmaster/checkpointer.c
+@@ -947,7 +947,9 @@ RequestCheckpoint(int flags)
+ 	/*
+ 	 * If in a standalone backend, just do it ourselves.
+ 	 */
++#if !defined(__wasi__) && !defined(__EMSCRIPTEN__)
+ 	if (!IsPostmasterEnvironment)
++#endif
+ 	{
+ 		/*
+ 		 * There's no point in doing slow checkpoints in a standalone backend,
+diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
+index d032091495..12623d4e44 100644
+--- a/src/backend/postmaster/postmaster.c
++++ b/src/backend/postmaster/postmaster.c
+@@ -1439,7 +1439,7 @@ getInstallationPaths(const char *argv0)
+ 	/* Locate the postgres executable itself */
+ 	if (find_my_exec(argv0, my_exec_path) < 0)
+ 		ereport(FATAL,
+-				(errmsg("%s: could not locate my own executable path", argv0)));
++				(errmsg("%s:1536: could not locate my own executable path", argv0)));
+ 
+ #ifdef EXEC_BACKEND
+ 	/* Locate executable backend before we change working directory */
+diff --git a/src/backend/storage/file/fd.c b/src/backend/storage/file/fd.c
+index a7c05b0a6f..052084c9bb 100644
+--- a/src/backend/storage/file/fd.c
++++ b/src/backend/storage/file/fd.c
+@@ -69,7 +69,7 @@
+  *
+  *-------------------------------------------------------------------------
+  */
+-
++#define PG_FD
+ #include "postgres.h"
+ 
+ #include <dirent.h>
+@@ -524,6 +524,11 @@ pg_file_exists(const char *name)
+ void
+ pg_flush_data(int fd, off_t offset, off_t nbytes)
+ {
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++    //int res = sync_file_range(fd, offset, nbytes, SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
++    (void)fsync(fd);
++    // fprintf(stderr, "# pg_flush_data(int fd=%d, off_t offset=%lld, off_t nbytes=%lld res=%d\n", fd,offset,nbytes, res);
++#else
+ 	/*
+ 	 * Right now file flushing is primarily used to avoid making later
+ 	 * fsync()/fdatasync() calls have less impact. Thus don't trigger flushes
+@@ -694,6 +699,7 @@ retry:
+ 		return;
+ 	}
+ #endif
++#endif /* wasm */
+ }
+ 
+ /*
+@@ -706,7 +712,6 @@ pg_ftruncate(int fd, off_t length)
+ 
+ retry:
+ 	ret = ftruncate(fd, length);
+-
+ 	if (ret == -1 && errno == EINTR)
+ 		goto retry;
+ 
+@@ -738,7 +743,6 @@ pg_truncate(const char *path, off_t length)
+ 
+ retry:
+ 	ret = truncate(path, length);
+-
+ 	if (ret == -1 && errno == EINTR)
+ 		goto retry;
+ #endif
+@@ -2672,7 +2676,7 @@ OpenTransientFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
+ 
+ 	return -1;					/* failure */
+ }
+-
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ /*
+  * Routines that want to initiate a pipe stream should use OpenPipeStream
+  * rather than plain popen().  This lets fd.c deal with freeing FDs if
+@@ -2732,7 +2736,7 @@ TryAgain:
+ 
+ 	return NULL;
+ }
+-
++#endif
+ /*
+  * Free an AllocateDesc of any type.
+  *
+diff --git a/src/backend/storage/ipc/ipc.c b/src/backend/storage/ipc/ipc.c
+index b06e4b8452..89f9e7355e 100644
+--- a/src/backend/storage/ipc/ipc.c
++++ b/src/backend/storage/ipc/ipc.c
+@@ -103,6 +103,48 @@ static int	on_proc_exit_index,
+ void
+ proc_exit(int code)
+ {
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++	if (code==66) {
++		fprintf(stderr,"# 108:fake shutdown\n");
++		proc_exit_inprogress = true;
++		InterruptPending = false;
++		ProcDiePending = false;
++		QueryCancelPending = false;
++		InterruptHoldoffCount = 1;
++		CritSectionCount = 0;
++
++		error_context_stack = NULL;
++		debug_query_string = NULL;
++
++		shmem_exit_inprogress = true;
++		int save_before_shmem_exit_index = before_shmem_exit_index;
++		while (--before_shmem_exit_index >= 0) {
++			if (before_shmem_exit_index!=4) {
++				printf("# skipped shmem_exit_index=%d/%d\n", before_shmem_exit_index, save_before_shmem_exit_index);
++				continue;
++			} else
++				printf("# before_shmem_exit_index=%d/%d\n", before_shmem_exit_index, save_before_shmem_exit_index);
++			before_shmem_exit_list[before_shmem_exit_index].function(code, before_shmem_exit_list[before_shmem_exit_index].arg);
++		}
++		before_shmem_exit_index = save_before_shmem_exit_index;
++		puts("# dsm_backend_shutdown ?");
++		// dsm_backend_shutdown();
++		shmem_exit_inprogress = false;
++		/*
++
++		int save_on_proc_exit_index = on_proc_exit_index;
++		while (--on_proc_exit_index >= 0) {
++			printf("# on_proc_exit_list=%d/%d\n", on_proc_exit_list, save_on_proc_exit_index);
++			on_proc_exit_list[on_proc_exit_index].function(code, on_proc_exit_list[on_proc_exit_index].arg);
++		}
++		on_proc_exit_index = save_on_proc_exit_index;
++		*/
++	} else {
++		proc_exit_inprogress = true;
++		fprintf(stderr,"# proc_exit(%d) ignored at 118:%s\n",code, __FILE__);
++    }
++    return;
++#endif
+ 	/* not safe if forked by system(), etc. */
+ 	if (MyProcPid != (int) getpid())
+ 		elog(PANIC, "proc_exit() called in child process");
+@@ -152,7 +194,6 @@ proc_exit(int code)
+ #endif
+ 
+ 	elog(DEBUG3, "exit(%d)", code);
+-
+ 	exit(code);
+ }
+ 
+@@ -228,7 +269,7 @@ void
+ shmem_exit(int code)
+ {
+ 	shmem_exit_inprogress = true;
+-
++if (code!=66){
+ 	/*
+ 	 * Call before_shmem_exit callbacks.
+ 	 *
+@@ -276,7 +317,7 @@ shmem_exit(int code)
+ 		on_shmem_exit_list[on_shmem_exit_index].function(code,
+ 														 on_shmem_exit_list[on_shmem_exit_index].arg);
+ 	on_shmem_exit_index = 0;
+-
++}
+ 	shmem_exit_inprogress = false;
+ }
+ 
+@@ -364,6 +405,17 @@ before_shmem_exit(pg_on_exit_callback function, Datum arg)
+ void
+ on_shmem_exit(pg_on_exit_callback function, Datum arg)
+ {
++#if defined(__wasi__) || defined(__EMSCRIPTEN__)
++    if (!atexit_callback_setup) {
++        PDEBUG("# 410:" __FILE__ " on_shmem_exit(pg_on_exit_callback function, Datum arg) FIRST CALL");
++        if (on_shmem_exit_index >= MAX_ON_EXITS) {
++            PDEBUG("# 412:" __FILE__ " on_shmem_exit(pg_on_exit_callback function, Datum arg) OVERFLOW");
++        }
++    } else {
++        PDEBUG("# 415:" __FILE__ " on_shmem_exit(pg_on_exit_callback function, Datum arg) STUB");
++        return;
++    }
++#endif
+ 	if (on_shmem_exit_index >= MAX_ON_EXITS)
+ 		ereport(FATAL,
+ 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+diff --git a/src/backend/storage/ipc/latch.c b/src/backend/storage/ipc/latch.c
+index 2b4ded3889..aeeab45446 100644
+--- a/src/backend/storage/ipc/latch.c
++++ b/src/backend/storage/ipc/latch.c
+@@ -231,6 +231,7 @@ ResourceOwnerForgetWaitEventSet(ResourceOwner owner, WaitEventSet *set)
+ void
+ InitializeLatchSupport(void)
+ {
++#if !defined(__wasi__)
+ #if defined(WAIT_USE_SELF_PIPE)
+ 	int			pipefd[2];
+ 
+@@ -340,6 +341,7 @@ InitializeLatchSupport(void)
+ 	/* Ignore SIGURG, because we'll receive it via kqueue. */
+ 	pqsignal(SIGURG, SIG_IGN);
+ #endif
++#endif /* __wasi__ */
+ }
+ 
+ void
+diff --git a/src/backend/storage/ipc/procsignal.c b/src/backend/storage/ipc/procsignal.c
+index 4ed9cedcdd..f4f73b0652 100644
+--- a/src/backend/storage/ipc/procsignal.c
++++ b/src/backend/storage/ipc/procsignal.c
+@@ -416,6 +416,9 @@ WaitForProcSignalBarrier(uint64 generation)
+ 						(errmsg("still waiting for backend with PID %d to accept ProcSignalBarrier",
+ 								(int) slot->pss_pid)));
+ 			oldval = pg_atomic_read_u64(&slot->pss_barrierGeneration);
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++            break;
++#endif
+ 		}
+ 		ConditionVariableCancelSleep();
+ 	}
+diff --git a/src/backend/storage/ipc/signalfuncs.c b/src/backend/storage/ipc/signalfuncs.c
+index 88e9bf8125..2db7ccfa5e 100644
+--- a/src/backend/storage/ipc/signalfuncs.c
++++ b/src/backend/storage/ipc/signalfuncs.c
+@@ -98,7 +98,12 @@ pg_signal_backend(int pid, int sig)
+ 	 */
+ 
+ 	/* If we have setsid(), signal the backend's whole process group */
+-#ifdef HAVE_SETSID
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++#   if PGDEBUG
++    printf("# 103: FIXME: kill(pid=%d, sig=%d) ", pid, sig);
++#   endif
++    if (0)
++#elif defined(HAVE_SETSID)
+ 	if (kill(-pid, sig))
+ #else
+ 	if (kill(pid, sig))
+@@ -106,7 +111,7 @@ pg_signal_backend(int pid, int sig)
+ 	{
+ 		/* Again, just a warning to allow loops */
+ 		ereport(WARNING,
+-				(errmsg("could not send signal to process %d: %m", pid)));
++				(errmsg("# 109: could not send signal to process %d: %m", pid)));
+ 		return SIGNAL_BACKEND_ERROR;
+ 	}
+ 	return SIGNAL_BACKEND_SUCCESS;
+diff --git a/src/backend/storage/ipc/sinvaladt.c b/src/backend/storage/ipc/sinvaladt.c
+index 271212987e..2b37b17795 100644
+--- a/src/backend/storage/ipc/sinvaladt.c
++++ b/src/backend/storage/ipc/sinvaladt.c
+@@ -288,17 +288,20 @@ SharedInvalBackendInit(bool sendOnly)
+ 	 * set hasMessages appropriately.
+ 	 */
+ 	LWLockAcquire(SInvalWriteLock, LW_EXCLUSIVE);
+-
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++#else
+ 	oldPid = stateP->procPid;
+ 	if (oldPid != 0)
+ 	{
++
++		elog(WARNING, "sinval slot for backend %d is already in use by process %d",
++			 MyProcNumber, (int) oldPid);
+ 		LWLockRelease(SInvalWriteLock);
+ 		elog(ERROR, "sinval slot for backend %d is already in use by process %d",
+ 			 MyProcNumber, (int) oldPid);
+ 	}
+-
+ 	shmInvalBuffer->pgprocnos[shmInvalBuffer->numProcs++] = MyProcNumber;
+-
++#endif
+ 	/* Fetch next local transaction ID into local memory */
+ 	nextLocalTransactionId = stateP->nextLXID;
+ 
+diff --git a/src/backend/storage/lmgr/proc.c b/src/backend/storage/lmgr/proc.c
+index b50e2eff21..7f1b5faa2b 100644
+--- a/src/backend/storage/lmgr/proc.c
++++ b/src/backend/storage/lmgr/proc.c
+@@ -307,7 +307,11 @@ InitProcess(void)
+ 		elog(PANIC, "proc header uninitialized");
+ 
+ 	if (MyProc != NULL)
+-		elog(ERROR, "you already exist");
++#if defined(__wasi__) || defined(__EMSCRIPTEN__)
++		elog(WARNING, "# 309: you already exist");
++#else
++		elog(ERROR, "# 309: you already exist");
++#endif
+ 
+ 	/*
+ 	 * Decide which list should supply our PGPROC.  This logic must match the
+@@ -538,7 +542,7 @@ InitAuxiliaryProcess(void)
+ 		elog(PANIC, "proc header uninitialized");
+ 
+ 	if (MyProc != NULL)
+-		elog(ERROR, "you already exist");
++		elog(ERROR, "# 522: you already exist");
+ 
+ 	/*
+ 	 * We use the ProcStructLock to protect assignment and releasing of
+diff --git a/src/backend/tcop/postgres.c b/src/backend/tcop/postgres.c
+index 9cd1d0abe3..72481df9bd 100644
+--- a/src/backend/tcop/postgres.c
++++ b/src/backend/tcop/postgres.c
+@@ -107,6 +107,19 @@ int			client_connection_check_interval = 0;
+ /* flags for non-system relation kinds to restrict use */
+ int			restrict_nonsystem_relation_kind;
+ 
++#if (defined(__EMSCRIPTEN__) || defined(__wasi__))
++#if !defined(PGL_MAIN)
++    volatile int cma_rsize = 0;
++    volatile bool sockfiles = false;
++#endif // PGL_MAIN
++bool quote_all_identifiers = false;
++FILE* SOCKET_FILE = NULL;
++int SOCKET_DATA = 0;
++#endif // WASM
++
++
++
++
+ /* ----------------
+  *		private typedefs etc
+  * ----------------
+@@ -4115,7 +4128,7 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
+ #endif
+ }
+ 
+-
++#if !defined(PGL_MAIN)
+ /*
+  * PostgresSingleUserMain
+  *     Entry point for single user mode. argc/argv are the command line
+@@ -5014,7 +5027,7 @@ PostgresMain(const char *dbname, const char *username)
+ 		}
+ 	}							/* end of input-reading loop */
+ }
+-
++#endif /* PGL_MAIN */
+ /*
+  * Throw an error if we're a WAL sender process.
+  *
+@@ -5133,8 +5146,9 @@ ShowUsage(const char *title)
+ 					 (long) user.tv_usec,
+ 					 (long) sys.tv_sec,
+ 					 (long) sys.tv_usec);
++#if !defined(__wasi__)
+ #ifndef WIN32
+-
++#if !defined(__wasi__)
+ 	/*
+ 	 * The following rusage fields are not defined by POSIX, but they're
+ 	 * present on all current Unix-like systems so we use them without any
+@@ -5176,8 +5190,9 @@ ShowUsage(const char *title)
+ 					 r.ru_nvcsw - Save_r.ru_nvcsw,
+ 					 r.ru_nivcsw - Save_r.ru_nivcsw,
+ 					 r.ru_nvcsw, r.ru_nivcsw);
++#endif  /* !__wasi__ */
+ #endif							/* !WIN32 */
+-
++#endif
+ 	/* remove trailing newline */
+ 	if (str.data[str.len - 1] == '\n')
+ 		str.data[--str.len] = '\0';
+diff --git a/src/backend/tcop/utility.c b/src/backend/tcop/utility.c
+index fa66b8017e..1b17405ae4 100644
+--- a/src/backend/tcop/utility.c
++++ b/src/backend/tcop/utility.c
+@@ -804,7 +804,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
+ 				ListenStmt *stmt = (ListenStmt *) parsetree;
+ 
+ 				CheckRestrictedOperation("LISTEN");
+-
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ 				/*
+ 				 * We don't allow LISTEN in background processes, as there is
+ 				 * no mechanism for them to collect NOTIFY messages, so they'd
+@@ -820,7 +820,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
+ 					/* translator: %s is name of a SQL command, eg LISTEN */
+ 							 errmsg("cannot execute %s within a background process",
+ 									"LISTEN")));
+-
++#endif
+ 				Async_Listen(stmt->conditionname);
+ 			}
+ 			break;
+diff --git a/src/backend/utils/adt/ruleutils.c b/src/backend/utils/adt/ruleutils.c
+index c6293b20cf..2699e31c1e 100644
+--- a/src/backend/utils/adt/ruleutils.c
++++ b/src/backend/utils/adt/ruleutils.c
+@@ -321,8 +321,9 @@ static SPIPlanPtr plan_getviewrule = NULL;
+ static const char *const query_getviewrule = "SELECT * FROM pg_catalog.pg_rewrite WHERE ev_class = $1 AND rulename = $2";
+ 
+ /* GUC parameters */
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ bool		quote_all_identifiers = false;
+-
++#endif
+ 
+ /* ----------
+  * Local functions
+diff --git a/src/backend/utils/fmgr/dfmgr.c b/src/backend/utils/fmgr/dfmgr.c
+index 092004dcf3..55c606dc74 100644
+--- a/src/backend/utils/fmgr/dfmgr.c
++++ b/src/backend/utils/fmgr/dfmgr.c
+@@ -121,12 +121,15 @@ load_external_function(const char *filename, const char *funcname,
+ 
+ 	/* Look up the function within the library. */
+ 	retval = dlsym(lib_handle, funcname);
+-
++#if !defined(__wasi__)
+ 	if (retval == NULL && signalNotFound)
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
+ 				 errmsg("could not find function \"%s\" in file \"%s\"",
+ 						funcname, fullname)));
++#else
++    fprintf(stderr, "could not find function \"%s\" in file \"%s\" rv=%p snf=%b\n", funcname, fullname, retval, signalNotFound);
++#endif
+ 
+ 	pfree(fullname);
+ 	return retval;
+diff --git a/src/backend/utils/init/miscinit.c b/src/backend/utils/init/miscinit.c
+index 8ac8ecc0db..0590684a85 100644
+--- a/src/backend/utils/init/miscinit.c
++++ b/src/backend/utils/init/miscinit.c
+@@ -144,7 +144,7 @@ InitPostmasterChild(void)
+ 	 * children, but for consistency we make all postmaster child processes do
+ 	 * this.
+ 	 */
+-#ifdef HAVE_SETSID
++#if defined(HAVE_SETSID) && !defined(__wasi__)
+ 	if (setsid() < 0)
+ 		elog(FATAL, "setsid() failed: %m");
+ #endif
+@@ -210,7 +210,7 @@ InitStandaloneProcess(const char *argv0)
+ 	if (my_exec_path[0] == '\0')
+ 	{
+ 		if (find_my_exec(argv0, my_exec_path) < 0)
+-			elog(FATAL, "%s: could not locate my own executable path",
++			elog(WARNING, "%s:212: could not locate my own executable path",
+ 				 argv0);
+ 	}
+ 
+@@ -375,7 +375,7 @@ checkDataDir(void)
+ 	 *
+ 	 * XXX can we safely enable this check on Windows?
+ 	 */
+-#if !defined(WIN32) && !defined(__CYGWIN__)
++#if !defined(WIN32) && !defined(__CYGWIN__) && !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ 	if (stat_buf.st_uid != geteuid())
+ 		ereport(FATAL,
+ 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+@@ -395,7 +395,7 @@ checkDataDir(void)
+ 	 * be proper support for Unix-y file permissions.  Need to think of a
+ 	 * reasonable check to apply on Windows.
+ 	 */
+-#if !defined(WIN32) && !defined(__CYGWIN__)
++#if !defined(WIN32) && !defined(__CYGWIN__) && !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ 	if (stat_buf.st_mode & PG_MODE_MASK_GROUP)
+ 		ereport(FATAL,
+ 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+@@ -416,7 +416,7 @@ checkDataDir(void)
+ 	 * Suppress when on Windows, because there may not be proper support for
+ 	 * Unix-y file permissions.
+ 	 */
+-#if !defined(WIN32) && !defined(__CYGWIN__)
++#if !defined(WIN32) && !defined(__CYGWIN__) && !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ 	SetDataDirectoryCreatePerm(stat_buf.st_mode);
+ 
+ 	umask(pg_mode_mask);
+@@ -1266,7 +1266,13 @@ CreateLockFile(const char *filename, bool amPostmaster,
+ 		 * Think not to make the file protection weaker than 0600/0640.  See
+ 		 * comments below.
+ 		 */
++
++#if defined(__wasi__)
++printf("# 1228: CreateLockFile(%s) w+ (forced)\n", filename);
++		fd = fileno(fopen(filename, "w+"));
++#else
+ 		fd = open(filename, O_RDWR | O_CREAT | O_EXCL, pg_file_create_mode);
++#endif
+ 		if (fd >= 0)
+ 			break;				/* Success; exit the retry loop */
+ 
+diff --git a/src/backend/utils/init/postinit.c b/src/backend/utils/init/postinit.c
+index 2ed7c7c02d..dc94e69b2e 100644
+--- a/src/backend/utils/init/postinit.c
++++ b/src/backend/utils/init/postinit.c
+@@ -13,6 +13,7 @@
+  *
+  *-------------------------------------------------------------------------
+  */
++#define PG_POSTINIT
+ #include "postgres.h"
+ 
+ #include <ctype.h>
+@@ -734,6 +735,7 @@ BaseInit(void)
+  *		Be very careful with the order of calls in the InitPostgres function.
+  * --------------------------------
+  */
++
+ void
+ InitPostgres(const char *in_dbname, Oid dboid,
+ 			 const char *username, Oid useroid,
+@@ -754,15 +756,15 @@ InitPostgres(const char *in_dbname, Oid dboid,
+ 	 * Once I have done this, I am visible to other backends!
+ 	 */
+ 	InitProcessPhase2();
+-
++puts("# 758:"__FILE__);
+ 	/*
+ 	 * Initialize my entry in the shared-invalidation manager's array of
+ 	 * per-backend data.
+ 	 */
+ 	SharedInvalBackendInit(false);
+-
++puts("# 764:"__FILE__);
+ 	ProcSignalInit();
+-
++puts("# 766:"__FILE__);
+ 	/*
+ 	 * Also set up timeout handlers needed for backend operation.  We need
+ 	 * these in every case except bootstrap.
+@@ -896,8 +898,18 @@ InitPostgres(const char *in_dbname, Oid dboid,
+ 	}
+ 	else if (!IsUnderPostmaster)
+ 	{
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++if (!strcmp( username , WASM_USERNAME )) {
++#endif
+ 		InitializeSessionUserIdStandalone();
+ 		am_superuser = true;
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++} else {
++        //puts("# 894: switching session id");
++        InitializeSessionUserId(username, InvalidOid, false);
++		am_superuser = superuser();
++}
++#endif
+ 		if (!ThereIsAtLeastOneRole())
+ 			ereport(WARNING,
+ 					(errcode(ERRCODE_UNDEFINED_OBJECT),
+@@ -1254,6 +1266,32 @@ InitPostgres(const char *in_dbname, Oid dboid,
+ 		CommitTransactionCommand();
+ }
+ 
++/* ========================================================================*/
++/*
++void
++ReInitPostgres(const char *in_dbname, Oid dboid,
++			 const char *username, Oid useroid,
++			 bool load_session_libraries,
++			 bool override_allow_connections,
++			 char *out_dbname)
++{
++    puts("ReInitPostgres:Begin");
++    InitPostgres(in_dbname, dboid, username, useroid, load_session_libraries, override_allow_connections, out_dbname);
++    puts("ReInitPostgres:End");
++}
++*/
++/* ========================================================================*/
++
++
++
++
++
++
++
++
++
++
++
+ /*
+  * Process any command-line switches and any additional GUC variable
+  * settings passed in the startup packet.
+@@ -1360,14 +1398,15 @@ process_settings(Oid databaseid, Oid roleid)
+ static void
+ ShutdownPostgres(int code, Datum arg)
+ {
++puts("# 1348: " __FILE__);
+ 	/* Make sure we've killed any active transaction */
+ 	AbortOutOfAnyTransaction();
+-
+ 	/*
+ 	 * User locks are not released by transaction end, so be sure to release
+ 	 * them explicitly.
+ 	 */
+ 	LockReleaseAll(USER_LOCKMETHOD, true);
++puts("# 1356: " __FILE__);
+ }
+ 
+ 
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index 0831d45aba..24069f953e 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -1861,7 +1861,6 @@ SelectConfigFiles(const char *userDoption, const char *progname)
+ 	 * data_directory parameter is picked up to determine the data directory,
+ 	 * so that we can read the PG_AUTOCONF_FILENAME file next time.
+ 	 */
+-	ProcessConfigFile(PGC_POSTMASTER);
+ 
+ 	/*
+ 	 * If the data_directory GUC variable has been set, use that as DataDir;
+@@ -1902,7 +1901,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
+ 	 * since we have to determine the DataDir before we can find the autoconf
+ 	 * file, the alternatives seem worse.)
+ 	 */
+-	ProcessConfigFile(PGC_POSTMASTER);
++
+ 
+ 	/*
+ 	 * If timezone_abbreviations wasn't set in the configuration file, install
+diff --git a/src/backend/utils/misc/timeout.c b/src/backend/utils/misc/timeout.c
+index ec7e570920..980a7de8eb 100644
+--- a/src/backend/utils/misc/timeout.c
++++ b/src/backend/utils/misc/timeout.c
+@@ -110,10 +110,20 @@ find_active_timeout(TimeoutId id)
+  * Insert specified timeout reason into the list of active timeouts
+  * at the given index.
+  */
++
++bool insert_timeout_warned = false;
+ static void
+ insert_timeout(TimeoutId id, int index)
+ {
+ 	int			i;
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++    if (!insert_timeout_warned) //(index<0)
++    {
++        insert_timeout_warned = true;
++        fprintf(stderr, "# 117(FATAL): insert_timeout(TimeoutId id=%d, int index=%d): " __FILE__ "\n", id, index);
++    }
++    return;
++#endif
+ 
+ 	if (index < 0 || index > num_active_timeouts)
+ 		elog(FATAL, "timeout index %d out of range 0..%d", index,
+@@ -128,6 +138,7 @@ insert_timeout(TimeoutId id, int index)
+ 	active_timeouts[index] = &all_timeouts[id];
+ 
+ 	num_active_timeouts++;
++
+ }
+ 
+ /*
+@@ -209,6 +220,10 @@ enable_timeout(TimeoutId id, TimestampTz now, TimestampTz fin_time,
+ static void
+ schedule_alarm(TimestampTz now)
+ {
++#if defined(__wasi__)
++    puts("# 224: schedule_alarm(TimestampTz now)");
++    (void)signal_due_at;
++#else
+ 	if (num_active_timeouts > 0)
+ 	{
+ 		struct itimerval timeval;
+@@ -347,6 +362,7 @@ schedule_alarm(TimestampTz now)
+ 			elog(FATAL, "could not enable SIGALRM timer: %m");
+ 		}
+ 	}
++#endif
+ }
+ 
+ 
+diff --git a/src/bin/pg_config/pg_config.c b/src/bin/pg_config/pg_config.c
+index 77d09ccfc4..1fc3e6298d 100644
+--- a/src/bin/pg_config/pg_config.c
++++ b/src/bin/pg_config/pg_config.c
+@@ -152,7 +152,9 @@ main(int argc, char **argv)
+ 	if (find_my_exec(argv[0], my_exec_path) < 0)
+ 	{
+ 		fprintf(stderr, _("%s: could not find own program executable\n"), progname);
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ 		exit(1);
++#endif
+ 	}
+ 
+ 	configdata = get_configdata(my_exec_path, &configdata_len);
+@@ -162,6 +164,7 @@ main(int argc, char **argv)
+ 		for (i = 0; i < configdata_len; i++)
+ 			printf("%s = %s\n", configdata[i].name, configdata[i].setting);
+ 		exit(0);
++
+ 	}
+ 
+ 	/* otherwise print requested items */
+diff --git a/src/bin/pg_ctl/pg_ctl.c b/src/bin/pg_ctl/pg_ctl.c
+index ed97eb3f50..ab34be3fa7 100644
+--- a/src/bin/pg_ctl/pg_ctl.c
++++ b/src/bin/pg_ctl/pg_ctl.c
+@@ -154,6 +154,16 @@ static bool wait_for_postmaster_stop(void);
+ static bool wait_for_postmaster_promote(void);
+ static bool postmaster_is_alive(pid_t pid);
+ 
++#if defined(__wasi__)
++#if defined(HAVE_SETSID)
++#undef HAVE_SETSID
++#endif
++
++#if defined(HAVE_GETRLIMIT)
++#undef HAVE_GETRLIMIT
++#endif
++#endif /* __wasi__ */
++
+ #if defined(HAVE_GETRLIMIT)
+ static void unlimit_core_size(void);
+ #endif
+@@ -492,9 +502,9 @@ start_postmaster(void)
+ 	else
+ 		cmd = psprintf("exec \"%s\" %s%s < \"%s\" 2>&1",
+ 					   exec_path, pgdata_opt, post_opts, DEVNULL);
+-
++#if !defined(__wasi__)
+ 	(void) execl("/bin/sh", "/bin/sh", "-c", cmd, (char *) NULL);
+-
++#endif
+ 	/* exec failed */
+ 	write_stderr(_("%s: could not start server: %m\n"),
+ 				 progname);
+diff --git a/src/bin/pg_dump/parallel.c b/src/bin/pg_dump/parallel.c
+index a09247fae4..c1b141a5c3 100644
+--- a/src/bin/pg_dump/parallel.c
++++ b/src/bin/pg_dump/parallel.c
+@@ -49,7 +49,7 @@
+  * The pstate->te[] entry for each worker is valid when it's in WRKR_WORKING
+  * state, and must be NULL in other states.
+  */
+-
++#define PG_DUMP_PARALLEL
+ #include "postgres_fe.h"
+ 
+ #ifndef WIN32
+@@ -445,6 +445,7 @@ ShutdownWorkersHard(ParallelState *pstate)
+ static void
+ WaitForTerminatingWorkers(ParallelState *pstate)
+ {
++#if !defined(__wasi__)
+ 	while (!HasEveryWorkerTerminated(pstate))
+ 	{
+ 		ParallelSlot *slot = NULL;
+@@ -504,6 +505,7 @@ WaitForTerminatingWorkers(ParallelState *pstate)
+ 		slot->workerStatus = WRKR_TERMINATED;
+ 		pstate->te[j] = NULL;
+ 	}
++#endif /* __wasi__ */
+ }
+ 
+ 
+diff --git a/src/bin/pg_dump/pg_backup_db.c b/src/bin/pg_dump/pg_backup_db.c
+index a02841c405..f57d971a23 100644
+--- a/src/bin/pg_dump/pg_backup_db.c
++++ b/src/bin/pg_dump/pg_backup_db.c
+@@ -268,9 +268,9 @@ notice_processor(void *arg, const char *message)
+ static void
+ die_on_query_failure(ArchiveHandle *AH, const char *query)
+ {
+-	pg_log_error("query failed: %s",
++	pg_log_error("# 271:" __FILE__ ": query failed: %s",
+ 				 PQerrorMessage(AH->connection));
+-	pg_log_error_detail("Query was: %s", query);
++	pg_log_error_detail("# 273:" __FILE__ ": Query was: %s", query);
+ 	exit(1);
+ }
+ 
+@@ -292,7 +292,7 @@ ExecuteSqlQuery(Archive *AHX, const char *query, ExecStatusType status)
+ 	ArchiveHandle *AH = (ArchiveHandle *) AHX;
+ 	PGresult   *res;
+ 
+-	res = PQexec(AH->connection, query);
++	res = PQexec(AH->connection, query); printf("# 295:" __FILE__ ": PQexec fail == %d q=%s\r\n", PQresultStatus(res) != status, query );
+ 	if (PQresultStatus(res) != status)
+ 		die_on_query_failure(AH, query);
+ 	return res;
+diff --git a/src/bin/pg_dump/pg_dump.c b/src/bin/pg_dump/pg_dump.c
+index 9ed1a856fa..b568fb63ad 100644
+--- a/src/bin/pg_dump/pg_dump.c
++++ b/src/bin/pg_dump/pg_dump.c
+@@ -30,6 +30,13 @@
+  *-------------------------------------------------------------------------
+  */
+ #include "postgres_fe.h"
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
++#ifdef quote_all_identifiers
++#undef quote_all_identifiers
++#endif
++#define fe_utils_quote_all_identifiers quote_all_identifiers
++static bool quote_all_identifiers;
++#endif
+ 
+ #include <unistd.h>
+ #include <ctype.h>
+@@ -425,7 +432,7 @@ main(int argc, char **argv)
+ 		{"lock-wait-timeout", required_argument, NULL, 2},
+ 		{"no-table-access-method", no_argument, &dopt.outputNoTableAm, 1},
+ 		{"no-tablespaces", no_argument, &dopt.outputNoTablespaces, 1},
+-		{"quote-all-identifiers", no_argument, &quote_all_identifiers, 1},
++		{"quote-all-identifiers", no_argument, (int *)(&fe_utils_quote_all_identifiers), true},
+ 		{"load-via-partition-root", no_argument, &dopt.load_via_partition_root, 1},
+ 		{"role", required_argument, NULL, 3},
+ 		{"section", required_argument, NULL, 5},
+@@ -452,7 +459,9 @@ main(int argc, char **argv)
+ 
+ 		{NULL, 0, NULL, 0}
+ 	};
+-
++#if defined(__wasi__)
++chdir("/");
++#endif
+ 	pg_logging_init(argv[0]);
+ 	pg_logging_set_level(PG_LOG_WARNING);
+ 	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_dump"));
+@@ -1281,7 +1290,7 @@ setup_connection(Archive *AH, const char *dumpencoding,
+ 	/*
+ 	 * Quote all identifiers, if requested.
+ 	 */
+-	if (quote_all_identifiers)
++	if (fe_utils_quote_all_identifiers)
+ 		ExecuteSqlStatement(AH, "SET quote_all_identifiers = true");
+ 
+ 	/*
+diff --git a/src/bin/pg_dump/pg_dumpall.c b/src/bin/pg_dump/pg_dumpall.c
+index d5282ecb17..27bdf2baf0 100644
+--- a/src/bin/pg_dump/pg_dumpall.c
++++ b/src/bin/pg_dump/pg_dumpall.c
+@@ -14,7 +14,13 @@
+  */
+ 
+ #include "postgres_fe.h"
+-
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
++#ifdef quote_all_identifiers
++#undef quote_all_identifiers
++#endif
++#define fe_utils_quote_all_identifiers quote_all_identifiers
++static bool quote_all_identifiers;
++#endif
+ #include <time.h>
+ #include <unistd.h>
+ 
+@@ -163,7 +169,7 @@ main(int argc, char *argv[])
+ 		{"lock-wait-timeout", required_argument, NULL, 2},
+ 		{"no-table-access-method", no_argument, &no_table_access_method, 1},
+ 		{"no-tablespaces", no_argument, &no_tablespaces, 1},
+-		{"quote-all-identifiers", no_argument, &quote_all_identifiers, 1},
++		{"quote-all-identifiers", no_argument, (int *)(&fe_utils_quote_all_identifiers), true},
+ 		{"load-via-partition-root", no_argument, &load_via_partition_root, 1},
+ 		{"role", required_argument, NULL, 3},
+ 		{"use-set-session-authorization", no_argument, &use_setsessauth, 1},
+@@ -439,7 +445,7 @@ main(int argc, char *argv[])
+ 		appendPQExpBufferStr(pgdumpopts, " --no-table-access-method");
+ 	if (no_tablespaces)
+ 		appendPQExpBufferStr(pgdumpopts, " --no-tablespaces");
+-	if (quote_all_identifiers)
++	if (fe_utils_quote_all_identifiers)
+ 		appendPQExpBufferStr(pgdumpopts, " --quote-all-identifiers");
+ 	if (load_via_partition_root)
+ 		appendPQExpBufferStr(pgdumpopts, " --load-via-partition-root");
+@@ -540,7 +546,7 @@ main(int argc, char *argv[])
+ 	}
+ 
+ 	/* Force quoting of all identifiers if requested. */
+-	if (quote_all_identifiers)
++	if (fe_utils_quote_all_identifiers)
+ 		executeCommand(conn, "SET quote_all_identifiers = true");
+ 
+ 	fprintf(OPF, "--\n-- PostgreSQL database cluster dump\n--\n\n");
+diff --git a/src/bin/pg_resetwal/pg_resetwal.c b/src/bin/pg_resetwal/pg_resetwal.c
+index e9dcb5a6d8..ebfe9256a8 100644
+--- a/src/bin/pg_resetwal/pg_resetwal.c
++++ b/src/bin/pg_resetwal/pg_resetwal.c
+@@ -334,7 +334,7 @@ main(int argc, char *argv[])
+ 	 * -- any other user won't have sufficient permissions to modify files in
+ 	 * the data directory.
+ 	 */
+-#ifndef WIN32
++#if !defined(WIN32) && !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ 	if (geteuid() == 0)
+ 	{
+ 		pg_log_error("cannot be executed by \"root\"");
+diff --git a/src/bin/pg_upgrade/parallel.c b/src/bin/pg_upgrade/parallel.c
+index 05313a9b15..e19e2efb1f 100644
+--- a/src/bin/pg_upgrade/parallel.c
++++ b/src/bin/pg_upgrade/parallel.c
+@@ -277,6 +277,7 @@ win32_transfer_all_new_dbs(transfer_thread_arg *args)
+ bool
+ reap_child(bool wait_for_child)
+ {
++#if !defined(__wasi__)
+ #ifndef WIN32
+ 	int			work_status;
+ 	pid_t		child;
+@@ -336,6 +337,6 @@ reap_child(bool wait_for_child)
+ 
+ 	/* do this after job has been removed */
+ 	parallel_jobs--;
+-
++#endif /* __wasi__ */
+ 	return true;
+ }
+diff --git a/src/bin/pg_verifybackup/pg_verifybackup.c b/src/bin/pg_verifybackup/pg_verifybackup.c
+index d77e70fbe3..f588d61c6f 100644
+--- a/src/bin/pg_verifybackup/pg_verifybackup.c
++++ b/src/bin/pg_verifybackup/pg_verifybackup.c
+@@ -1,1104 +1 @@
+-/*-------------------------------------------------------------------------
+- *
+- * pg_verifybackup.c
+- *	  Verify a backup against a backup manifest.
+- *
+- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+- * Portions Copyright (c) 1994, Regents of the University of California
+- *
+- * src/bin/pg_verifybackup/pg_verifybackup.c
+- *
+- *-------------------------------------------------------------------------
+- */
+-
+-#include "postgres_fe.h"
+-
+-#include <dirent.h>
+-#include <fcntl.h>
+-#include <sys/stat.h>
+-#include <time.h>
+-
+-#include "common/controldata_utils.h"
+-#include "common/hashfn_unstable.h"
+-#include "common/logging.h"
+-#include "common/parse_manifest.h"
+-#include "fe_utils/simple_list.h"
+-#include "getopt_long.h"
+-#include "pgtime.h"
+-
+-/*
+- * For efficiency, we'd like our hash table containing information about the
+- * manifest to start out with approximately the correct number of entries.
+- * There's no way to know the exact number of entries without reading the whole
+- * file, but we can get an estimate by dividing the file size by the estimated
+- * number of bytes per line.
+- *
+- * This could be off by about a factor of two in either direction, because the
+- * checksum algorithm has a big impact on the line lengths; e.g. a SHA512
+- * checksum is 128 hex bytes, whereas a CRC-32C value is only 8, and there
+- * might be no checksum at all.
+- */
+-#define ESTIMATED_BYTES_PER_MANIFEST_LINE	100
+-
+-/*
+- * How many bytes should we try to read from a file at once?
+- */
+-#define READ_CHUNK_SIZE				(128 * 1024)
+-
+-/*
+- * Each file described by the manifest file is parsed to produce an object
+- * like this.
+- */
+-typedef struct manifest_file
+-{
+-	uint32		status;			/* hash status */
+-	const char *pathname;
+-	size_t		size;
+-	pg_checksum_type checksum_type;
+-	int			checksum_length;
+-	uint8	   *checksum_payload;
+-	bool		matched;
+-	bool		bad;
+-} manifest_file;
+-
+-#define should_verify_checksum(m) \
+-	(((m)->matched) && !((m)->bad) && (((m)->checksum_type) != CHECKSUM_TYPE_NONE))
+-
+-/*
+- * Define a hash table which we can use to store information about the files
+- * mentioned in the backup manifest.
+- */
+-#define SH_PREFIX		manifest_files
+-#define SH_ELEMENT_TYPE	manifest_file
+-#define SH_KEY_TYPE		const char *
+-#define	SH_KEY			pathname
+-#define SH_HASH_KEY(tb, key)	hash_string(key)
+-#define SH_EQUAL(tb, a, b)		(strcmp(a, b) == 0)
+-#define	SH_SCOPE		static inline
+-#define SH_RAW_ALLOCATOR	pg_malloc0
+-#define SH_DECLARE
+-#define SH_DEFINE
+-#include "lib/simplehash.h"
+-
+-/*
+- * Each WAL range described by the manifest file is parsed to produce an
+- * object like this.
+- */
+-typedef struct manifest_wal_range
+-{
+-	TimeLineID	tli;
+-	XLogRecPtr	start_lsn;
+-	XLogRecPtr	end_lsn;
+-	struct manifest_wal_range *next;
+-	struct manifest_wal_range *prev;
+-} manifest_wal_range;
+-
+-/*
+- * All the data parsed from a backup_manifest file.
+- */
+-typedef struct manifest_data
+-{
+-	int			version;
+-	uint64		system_identifier;
+-	manifest_files_hash *files;
+-	manifest_wal_range *first_wal_range;
+-	manifest_wal_range *last_wal_range;
+-} manifest_data;
+-
+-/*
+- * All of the context information we need while checking a backup manifest.
+- */
+-typedef struct verifier_context
+-{
+-	manifest_data *manifest;
+-	char	   *backup_directory;
+-	SimpleStringList ignore_list;
+-	bool		exit_on_error;
+-	bool		saw_any_error;
+-} verifier_context;
+-
+-static manifest_data *parse_manifest_file(char *manifest_path);
+-static void verifybackup_version_cb(JsonManifestParseContext *context,
+-									int manifest_version);
+-static void verifybackup_system_identifier(JsonManifestParseContext *context,
+-										   uint64 manifest_system_identifier);
+-static void verifybackup_per_file_cb(JsonManifestParseContext *context,
+-									 const char *pathname, size_t size,
+-									 pg_checksum_type checksum_type,
+-									 int checksum_length,
+-									 uint8 *checksum_payload);
+-static void verifybackup_per_wal_range_cb(JsonManifestParseContext *context,
+-										  TimeLineID tli,
+-										  XLogRecPtr start_lsn,
+-										  XLogRecPtr end_lsn);
+-static void report_manifest_error(JsonManifestParseContext *context,
+-								  const char *fmt,...)
+-			pg_attribute_printf(2, 3) pg_attribute_noreturn();
+-
+-static void verify_backup_directory(verifier_context *context,
+-									char *relpath, char *fullpath);
+-static void verify_backup_file(verifier_context *context,
+-							   char *relpath, char *fullpath);
+-static void verify_control_file(const char *controlpath,
+-								uint64 manifest_system_identifier);
+-static void report_extra_backup_files(verifier_context *context);
+-static void verify_backup_checksums(verifier_context *context);
+-static void verify_file_checksum(verifier_context *context,
+-								 manifest_file *m, char *fullpath,
+-								 uint8 *buffer);
+-static void parse_required_wal(verifier_context *context,
+-							   char *pg_waldump_path,
+-							   char *wal_directory);
+-
+-static void report_backup_error(verifier_context *context,
+-								const char *pg_restrict fmt,...)
+-			pg_attribute_printf(2, 3);
+-static void report_fatal_error(const char *pg_restrict fmt,...)
+-			pg_attribute_printf(1, 2) pg_attribute_noreturn();
+-static bool should_ignore_relpath(verifier_context *context, const char *relpath);
+-
+-static void progress_report(bool finished);
+-static void usage(void);
+-
+-static const char *progname;
+-
+-/* options */
+-static bool show_progress = false;
+-static bool skip_checksums = false;
+-
+-/* Progress indicators */
+-static uint64 total_size = 0;
+-static uint64 done_size = 0;
+-
+-/*
+- * Main entry point.
+- */
+-int
+-main(int argc, char **argv)
+-{
+-	static struct option long_options[] = {
+-		{"exit-on-error", no_argument, NULL, 'e'},
+-		{"ignore", required_argument, NULL, 'i'},
+-		{"manifest-path", required_argument, NULL, 'm'},
+-		{"no-parse-wal", no_argument, NULL, 'n'},
+-		{"progress", no_argument, NULL, 'P'},
+-		{"quiet", no_argument, NULL, 'q'},
+-		{"skip-checksums", no_argument, NULL, 's'},
+-		{"wal-directory", required_argument, NULL, 'w'},
+-		{NULL, 0, NULL, 0}
+-	};
+-
+-	int			c;
+-	verifier_context context;
+-	char	   *manifest_path = NULL;
+-	bool		no_parse_wal = false;
+-	bool		quiet = false;
+-	char	   *wal_directory = NULL;
+-	char	   *pg_waldump_path = NULL;
+-
+-	pg_logging_init(argv[0]);
+-	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_verifybackup"));
+-	progname = get_progname(argv[0]);
+-
+-	memset(&context, 0, sizeof(context));
+-
+-	if (argc > 1)
+-	{
+-		if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-?") == 0)
+-		{
+-			usage();
+-			exit(0);
+-		}
+-		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
+-		{
+-			puts("pg_verifybackup (PostgreSQL) " PG_VERSION);
+-			exit(0);
+-		}
+-	}
+-
+-	/*
+-	 * Skip certain files in the toplevel directory.
+-	 *
+-	 * Ignore the backup_manifest file, because it's not included in the
+-	 * backup manifest.
+-	 *
+-	 * Ignore the pg_wal directory, because those files are not included in
+-	 * the backup manifest either, since they are fetched separately from the
+-	 * backup itself, and verified via a separate mechanism.
+-	 *
+-	 * Ignore postgresql.auto.conf, recovery.signal, and standby.signal,
+-	 * because we expect that those files may sometimes be created or changed
+-	 * as part of the backup process. For example, pg_basebackup -R will
+-	 * modify postgresql.auto.conf and create standby.signal.
+-	 */
+-	simple_string_list_append(&context.ignore_list, "backup_manifest");
+-	simple_string_list_append(&context.ignore_list, "pg_wal");
+-	simple_string_list_append(&context.ignore_list, "postgresql.auto.conf");
+-	simple_string_list_append(&context.ignore_list, "recovery.signal");
+-	simple_string_list_append(&context.ignore_list, "standby.signal");
+-
+-	while ((c = getopt_long(argc, argv, "ei:m:nPqsw:", long_options, NULL)) != -1)
+-	{
+-		switch (c)
+-		{
+-			case 'e':
+-				context.exit_on_error = true;
+-				break;
+-			case 'i':
+-				{
+-					char	   *arg = pstrdup(optarg);
+-
+-					canonicalize_path(arg);
+-					simple_string_list_append(&context.ignore_list, arg);
+-					break;
+-				}
+-			case 'm':
+-				manifest_path = pstrdup(optarg);
+-				canonicalize_path(manifest_path);
+-				break;
+-			case 'n':
+-				no_parse_wal = true;
+-				break;
+-			case 'P':
+-				show_progress = true;
+-				break;
+-			case 'q':
+-				quiet = true;
+-				break;
+-			case 's':
+-				skip_checksums = true;
+-				break;
+-			case 'w':
+-				wal_directory = pstrdup(optarg);
+-				canonicalize_path(wal_directory);
+-				break;
+-			default:
+-				/* getopt_long already emitted a complaint */
+-				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
+-				exit(1);
+-		}
+-	}
+-
+-	/* Get backup directory name */
+-	if (optind >= argc)
+-	{
+-		pg_log_error("no backup directory specified");
+-		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
+-		exit(1);
+-	}
+-	context.backup_directory = pstrdup(argv[optind++]);
+-	canonicalize_path(context.backup_directory);
+-
+-	/* Complain if any arguments remain */
+-	if (optind < argc)
+-	{
+-		pg_log_error("too many command-line arguments (first is \"%s\")",
+-					 argv[optind]);
+-		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
+-		exit(1);
+-	}
+-
+-	/* Complain if the specified arguments conflict */
+-	if (show_progress && quiet)
+-		pg_fatal("cannot specify both %s and %s",
+-				 "-P/--progress", "-q/--quiet");
+-
+-	/* Unless --no-parse-wal was specified, we will need pg_waldump. */
+-	if (!no_parse_wal)
+-	{
+-		int			ret;
+-
+-		pg_waldump_path = pg_malloc(MAXPGPATH);
+-		ret = find_other_exec(argv[0], "pg_waldump",
+-							  "pg_waldump (PostgreSQL) " PG_VERSION "\n",
+-							  pg_waldump_path);
+-		if (ret < 0)
+-		{
+-			char		full_path[MAXPGPATH];
+-
+-			if (find_my_exec(argv[0], full_path) < 0)
+-				strlcpy(full_path, progname, sizeof(full_path));
+-
+-			if (ret == -1)
+-				pg_fatal("program \"%s\" is needed by %s but was not found in the same directory as \"%s\"",
+-						 "pg_waldump", "pg_verifybackup", full_path);
+-			else
+-				pg_fatal("program \"%s\" was found by \"%s\" but was not the same version as %s",
+-						 "pg_waldump", full_path, "pg_verifybackup");
+-		}
+-	}
+-
+-	/* By default, look for the manifest in the backup directory. */
+-	if (manifest_path == NULL)
+-		manifest_path = psprintf("%s/backup_manifest",
+-								 context.backup_directory);
+-
+-	/* By default, look for the WAL in the backup directory, too. */
+-	if (wal_directory == NULL)
+-		wal_directory = psprintf("%s/pg_wal", context.backup_directory);
+-
+-	/*
+-	 * Try to read the manifest. We treat any errors encountered while parsing
+-	 * the manifest as fatal; there doesn't seem to be much point in trying to
+-	 * verify the backup directory against a corrupted manifest.
+-	 */
+-	context.manifest = parse_manifest_file(manifest_path);
+-
+-	/*
+-	 * Now scan the files in the backup directory. At this stage, we verify
+-	 * that every file on disk is present in the manifest and that the sizes
+-	 * match. We also set the "matched" flag on every manifest entry that
+-	 * corresponds to a file on disk.
+-	 */
+-	verify_backup_directory(&context, NULL, context.backup_directory);
+-
+-	/*
+-	 * The "matched" flag should now be set on every entry in the hash table.
+-	 * Any entries for which the bit is not set are files mentioned in the
+-	 * manifest that don't exist on disk.
+-	 */
+-	report_extra_backup_files(&context);
+-
+-	/*
+-	 * Now do the expensive work of verifying file checksums, unless we were
+-	 * told to skip it.
+-	 */
+-	if (!skip_checksums)
+-		verify_backup_checksums(&context);
+-
+-	/*
+-	 * Try to parse the required ranges of WAL records, unless we were told
+-	 * not to do so.
+-	 */
+-	if (!no_parse_wal)
+-		parse_required_wal(&context, pg_waldump_path, wal_directory);
+-
+-	/*
+-	 * If everything looks OK, tell the user this, unless we were asked to
+-	 * work quietly.
+-	 */
+-	if (!context.saw_any_error && !quiet)
+-		printf(_("backup successfully verified\n"));
+-
+-	return context.saw_any_error ? 1 : 0;
+-}
+-
+-/*
+- * Parse a manifest file and return a data structure describing the contents.
+- */
+-static manifest_data *
+-parse_manifest_file(char *manifest_path)
+-{
+-	int			fd;
+-	struct stat statbuf;
+-	off_t		estimate;
+-	uint32		initial_size;
+-	manifest_files_hash *ht;
+-	char	   *buffer;
+-	int			rc;
+-	JsonManifestParseContext context;
+-	manifest_data *result;
+-
+-	int			chunk_size = READ_CHUNK_SIZE;
+-
+-	/* Open the manifest file. */
+-	if ((fd = open(manifest_path, O_RDONLY | PG_BINARY, 0)) < 0)
+-		report_fatal_error("could not open file \"%s\": %m", manifest_path);
+-
+-	/* Figure out how big the manifest is. */
+-	if (fstat(fd, &statbuf) != 0)
+-		report_fatal_error("could not stat file \"%s\": %m", manifest_path);
+-
+-	/* Guess how large to make the hash table based on the manifest size. */
+-	estimate = statbuf.st_size / ESTIMATED_BYTES_PER_MANIFEST_LINE;
+-	initial_size = Min(PG_UINT32_MAX, Max(estimate, 256));
+-
+-	/* Create the hash table. */
+-	ht = manifest_files_create(initial_size, NULL);
+-
+-	result = pg_malloc0(sizeof(manifest_data));
+-	result->files = ht;
+-	context.private_data = result;
+-	context.version_cb = verifybackup_version_cb;
+-	context.system_identifier_cb = verifybackup_system_identifier;
+-	context.per_file_cb = verifybackup_per_file_cb;
+-	context.per_wal_range_cb = verifybackup_per_wal_range_cb;
+-	context.error_cb = report_manifest_error;
+-
+-	/*
+-	 * Parse the file, in chunks if necessary.
+-	 */
+-	if (statbuf.st_size <= chunk_size)
+-	{
+-		buffer = pg_malloc(statbuf.st_size);
+-		rc = read(fd, buffer, statbuf.st_size);
+-		if (rc != statbuf.st_size)
+-		{
+-			if (rc < 0)
+-				pg_fatal("could not read file \"%s\": %m", manifest_path);
+-			else
+-				pg_fatal("could not read file \"%s\": read %d of %lld",
+-						 manifest_path, rc, (long long int) statbuf.st_size);
+-		}
+-
+-		/* Close the manifest file. */
+-		close(fd);
+-
+-		/* Parse the manifest. */
+-		json_parse_manifest(&context, buffer, statbuf.st_size);
+-	}
+-	else
+-	{
+-		int			bytes_left = statbuf.st_size;
+-		JsonManifestParseIncrementalState *inc_state;
+-
+-		inc_state = json_parse_manifest_incremental_init(&context);
+-
+-		buffer = pg_malloc(chunk_size + 1);
+-
+-		while (bytes_left > 0)
+-		{
+-			int			bytes_to_read = chunk_size;
+-
+-			/*
+-			 * Make sure that the last chunk is sufficiently large. (i.e. at
+-			 * least half the chunk size) so that it will contain fully the
+-			 * piece at the end with the checksum.
+-			 */
+-			if (bytes_left < chunk_size)
+-				bytes_to_read = bytes_left;
+-			else if (bytes_left < 2 * chunk_size)
+-				bytes_to_read = bytes_left / 2;
+-			rc = read(fd, buffer, bytes_to_read);
+-			if (rc != bytes_to_read)
+-			{
+-				if (rc < 0)
+-					pg_fatal("could not read file \"%s\": %m", manifest_path);
+-				else
+-					pg_fatal("could not read file \"%s\": read %lld of %lld",
+-							 manifest_path,
+-							 (long long int) (statbuf.st_size + rc - bytes_left),
+-							 (long long int) statbuf.st_size);
+-			}
+-			bytes_left -= rc;
+-			json_parse_manifest_incremental_chunk(inc_state, buffer, rc,
+-												  bytes_left == 0);
+-		}
+-
+-		/* Release the incremental state memory */
+-		json_parse_manifest_incremental_shutdown(inc_state);
+-
+-		close(fd);
+-	}
+-
+-	/* Done with the buffer. */
+-	pfree(buffer);
+-
+-	return result;
+-}
+-
+-/*
+- * Report an error while parsing the manifest.
+- *
+- * We consider all such errors to be fatal errors. The manifest parser
+- * expects this function not to return.
+- */
+-static void
+-report_manifest_error(JsonManifestParseContext *context, const char *fmt,...)
+-{
+-	va_list		ap;
+-
+-	va_start(ap, fmt);
+-	pg_log_generic_v(PG_LOG_ERROR, PG_LOG_PRIMARY, gettext(fmt), ap);
+-	va_end(ap);
+-
+-	exit(1);
+-}
+-
+-/*
+- * Record details extracted from the backup manifest.
+- */
+-static void
+-verifybackup_version_cb(JsonManifestParseContext *context,
+-						int manifest_version)
+-{
+-	manifest_data *manifest = context->private_data;
+-
+-	/* Validation will be at the later stage */
+-	manifest->version = manifest_version;
+-}
+-
+-/*
+- * Record details extracted from the backup manifest.
+- */
+-static void
+-verifybackup_system_identifier(JsonManifestParseContext *context,
+-							   uint64 manifest_system_identifier)
+-{
+-	manifest_data *manifest = context->private_data;
+-
+-	/* Validation will be at the later stage */
+-	manifest->system_identifier = manifest_system_identifier;
+-}
+-
+-/*
+- * Record details extracted from the backup manifest for one file.
+- */
+-static void
+-verifybackup_per_file_cb(JsonManifestParseContext *context,
+-						 const char *pathname, size_t size,
+-						 pg_checksum_type checksum_type,
+-						 int checksum_length, uint8 *checksum_payload)
+-{
+-	manifest_data *manifest = context->private_data;
+-	manifest_files_hash *ht = manifest->files;
+-	manifest_file *m;
+-	bool		found;
+-
+-	/* Make a new entry in the hash table for this file. */
+-	m = manifest_files_insert(ht, pathname, &found);
+-	if (found)
+-		report_fatal_error("duplicate path name in backup manifest: \"%s\"",
+-						   pathname);
+-
+-	/* Initialize the entry. */
+-	m->size = size;
+-	m->checksum_type = checksum_type;
+-	m->checksum_length = checksum_length;
+-	m->checksum_payload = checksum_payload;
+-	m->matched = false;
+-	m->bad = false;
+-}
+-
+-/*
+- * Record details extracted from the backup manifest for one WAL range.
+- */
+-static void
+-verifybackup_per_wal_range_cb(JsonManifestParseContext *context,
+-							  TimeLineID tli,
+-							  XLogRecPtr start_lsn, XLogRecPtr end_lsn)
+-{
+-	manifest_data *manifest = context->private_data;
+-	manifest_wal_range *range;
+-
+-	/* Allocate and initialize a struct describing this WAL range. */
+-	range = palloc(sizeof(manifest_wal_range));
+-	range->tli = tli;
+-	range->start_lsn = start_lsn;
+-	range->end_lsn = end_lsn;
+-	range->prev = manifest->last_wal_range;
+-	range->next = NULL;
+-
+-	/* Add it to the end of the list. */
+-	if (manifest->first_wal_range == NULL)
+-		manifest->first_wal_range = range;
+-	else
+-		manifest->last_wal_range->next = range;
+-	manifest->last_wal_range = range;
+-}
+-
+-/*
+- * Verify one directory.
+- *
+- * 'relpath' is NULL if we are to verify the top-level backup directory,
+- * and otherwise the relative path to the directory that is to be verified.
+- *
+- * 'fullpath' is the backup directory with 'relpath' appended; i.e. the actual
+- * filesystem path at which it can be found.
+- */
+-static void
+-verify_backup_directory(verifier_context *context, char *relpath,
+-						char *fullpath)
+-{
+-	DIR		   *dir;
+-	struct dirent *dirent;
+-
+-	dir = opendir(fullpath);
+-	if (dir == NULL)
+-	{
+-		/*
+-		 * If even the toplevel backup directory cannot be found, treat this
+-		 * as a fatal error.
+-		 */
+-		if (relpath == NULL)
+-			report_fatal_error("could not open directory \"%s\": %m", fullpath);
+-
+-		/*
+-		 * Otherwise, treat this as a non-fatal error, but ignore any further
+-		 * errors related to this path and anything beneath it.
+-		 */
+-		report_backup_error(context,
+-							"could not open directory \"%s\": %m", fullpath);
+-		simple_string_list_append(&context->ignore_list, relpath);
+-
+-		return;
+-	}
+-
+-	while (errno = 0, (dirent = readdir(dir)) != NULL)
+-	{
+-		char	   *filename = dirent->d_name;
+-		char	   *newfullpath = psprintf("%s/%s", fullpath, filename);
+-		char	   *newrelpath;
+-
+-		/* Skip "." and ".." */
+-		if (filename[0] == '.' && (filename[1] == '\0'
+-								   || strcmp(filename, "..") == 0))
+-			continue;
+-
+-		if (relpath == NULL)
+-			newrelpath = pstrdup(filename);
+-		else
+-			newrelpath = psprintf("%s/%s", relpath, filename);
+-
+-		if (!should_ignore_relpath(context, newrelpath))
+-			verify_backup_file(context, newrelpath, newfullpath);
+-
+-		pfree(newfullpath);
+-		pfree(newrelpath);
+-	}
+-
+-	if (closedir(dir))
+-	{
+-		report_backup_error(context,
+-							"could not close directory \"%s\": %m", fullpath);
+-		return;
+-	}
+-}
+-
+-/*
+- * Verify one file (which might actually be a directory or a symlink).
+- *
+- * The arguments to this function have the same meaning as the arguments to
+- * verify_backup_directory.
+- */
+-static void
+-verify_backup_file(verifier_context *context, char *relpath, char *fullpath)
+-{
+-	struct stat sb;
+-	manifest_file *m;
+-
+-	if (stat(fullpath, &sb) != 0)
+-	{
+-		report_backup_error(context,
+-							"could not stat file or directory \"%s\": %m",
+-							relpath);
+-
+-		/*
+-		 * Suppress further errors related to this path name and, if it's a
+-		 * directory, anything underneath it.
+-		 */
+-		simple_string_list_append(&context->ignore_list, relpath);
+-
+-		return;
+-	}
+-
+-	/* If it's a directory, just recurse. */
+-	if (S_ISDIR(sb.st_mode))
+-	{
+-		verify_backup_directory(context, relpath, fullpath);
+-		return;
+-	}
+-
+-	/* If it's not a directory, it should be a plain file. */
+-	if (!S_ISREG(sb.st_mode))
+-	{
+-		report_backup_error(context,
+-							"\"%s\" is not a file or directory",
+-							relpath);
+-		return;
+-	}
+-
+-	/* Check whether there's an entry in the manifest hash. */
+-	m = manifest_files_lookup(context->manifest->files, relpath);
+-	if (m == NULL)
+-	{
+-		report_backup_error(context,
+-							"\"%s\" is present on disk but not in the manifest",
+-							relpath);
+-		return;
+-	}
+-
+-	/* Flag this entry as having been encountered in the filesystem. */
+-	m->matched = true;
+-
+-	/* Check that the size matches. */
+-	if (m->size != sb.st_size)
+-	{
+-		report_backup_error(context,
+-							"\"%s\" has size %lld on disk but size %zu in the manifest",
+-							relpath, (long long int) sb.st_size, m->size);
+-		m->bad = true;
+-	}
+-
+-	/*
+-	 * Validate the manifest system identifier, not available in manifest
+-	 * version 1.
+-	 */
+-	if (context->manifest->version != 1 &&
+-		strcmp(relpath, "global/pg_control") == 0)
+-		verify_control_file(fullpath, context->manifest->system_identifier);
+-
+-	/* Update statistics for progress report, if necessary */
+-	if (show_progress && !skip_checksums && should_verify_checksum(m))
+-		total_size += m->size;
+-
+-	/*
+-	 * We don't verify checksums at this stage. We first finish verifying that
+-	 * we have the expected set of files with the expected sizes, and only
+-	 * afterwards verify the checksums. That's because computing checksums may
+-	 * take a while, and we'd like to report more obvious problems quickly.
+-	 */
+-}
+-
+-/*
+- * Sanity check control file and validate system identifier against manifest
+- * system identifier.
+- */
+-static void
+-verify_control_file(const char *controlpath, uint64 manifest_system_identifier)
+-{
+-	ControlFileData *control_file;
+-	bool		crc_ok;
+-
+-	pg_log_debug("reading \"%s\"", controlpath);
+-	control_file = get_controlfile_by_exact_path(controlpath, &crc_ok);
+-
+-	/* Control file contents not meaningful if CRC is bad. */
+-	if (!crc_ok)
+-		report_fatal_error("%s: CRC is incorrect", controlpath);
+-
+-	/* Can't interpret control file if not current version. */
+-	if (control_file->pg_control_version != PG_CONTROL_VERSION)
+-		report_fatal_error("%s: unexpected control file version",
+-						   controlpath);
+-
+-	/* System identifiers should match. */
+-	if (manifest_system_identifier != control_file->system_identifier)
+-		report_fatal_error("%s: manifest system identifier is %llu, but control file has %llu",
+-						   controlpath,
+-						   (unsigned long long) manifest_system_identifier,
+-						   (unsigned long long) control_file->system_identifier);
+-
+-	/* Release memory. */
+-	pfree(control_file);
+-}
+-
+-/*
+- * Scan the hash table for entries where the 'matched' flag is not set; report
+- * that such files are present in the manifest but not on disk.
+- */
+-static void
+-report_extra_backup_files(verifier_context *context)
+-{
+-	manifest_data *manifest = context->manifest;
+-	manifest_files_iterator it;
+-	manifest_file *m;
+-
+-	manifest_files_start_iterate(manifest->files, &it);
+-	while ((m = manifest_files_iterate(manifest->files, &it)) != NULL)
+-		if (!m->matched && !should_ignore_relpath(context, m->pathname))
+-			report_backup_error(context,
+-								"\"%s\" is present in the manifest but not on disk",
+-								m->pathname);
+-}
+-
+-/*
+- * Verify checksums for hash table entries that are otherwise unproblematic.
+- * If we've already reported some problem related to a hash table entry, or
+- * if it has no checksum, just skip it.
+- */
+-static void
+-verify_backup_checksums(verifier_context *context)
+-{
+-	manifest_data *manifest = context->manifest;
+-	manifest_files_iterator it;
+-	manifest_file *m;
+-	uint8	   *buffer;
+-
+-	progress_report(false);
+-
+-	buffer = pg_malloc(READ_CHUNK_SIZE * sizeof(uint8));
+-
+-	manifest_files_start_iterate(manifest->files, &it);
+-	while ((m = manifest_files_iterate(manifest->files, &it)) != NULL)
+-	{
+-		if (should_verify_checksum(m) &&
+-			!should_ignore_relpath(context, m->pathname))
+-		{
+-			char	   *fullpath;
+-
+-			/* Compute the full pathname to the target file. */
+-			fullpath = psprintf("%s/%s", context->backup_directory,
+-								m->pathname);
+-
+-			/* Do the actual checksum verification. */
+-			verify_file_checksum(context, m, fullpath, buffer);
+-
+-			/* Avoid leaking memory. */
+-			pfree(fullpath);
+-		}
+-	}
+-
+-	pfree(buffer);
+-
+-	progress_report(true);
+-}
+-
+-/*
+- * Verify the checksum of a single file.
+- */
+-static void
+-verify_file_checksum(verifier_context *context, manifest_file *m,
+-					 char *fullpath, uint8 *buffer)
+-{
+-	pg_checksum_context checksum_ctx;
+-	const char *relpath = m->pathname;
+-	int			fd;
+-	int			rc;
+-	size_t		bytes_read = 0;
+-	uint8		checksumbuf[PG_CHECKSUM_MAX_LENGTH];
+-	int			checksumlen;
+-
+-	/* Open the target file. */
+-	if ((fd = open(fullpath, O_RDONLY | PG_BINARY, 0)) < 0)
+-	{
+-		report_backup_error(context, "could not open file \"%s\": %m",
+-							relpath);
+-		return;
+-	}
+-
+-	/* Initialize checksum context. */
+-	if (pg_checksum_init(&checksum_ctx, m->checksum_type) < 0)
+-	{
+-		report_backup_error(context, "could not initialize checksum of file \"%s\"",
+-							relpath);
+-		close(fd);
+-		return;
+-	}
+-
+-	/* Read the file chunk by chunk, updating the checksum as we go. */
+-	while ((rc = read(fd, buffer, READ_CHUNK_SIZE)) > 0)
+-	{
+-		bytes_read += rc;
+-		if (pg_checksum_update(&checksum_ctx, buffer, rc) < 0)
+-		{
+-			report_backup_error(context, "could not update checksum of file \"%s\"",
+-								relpath);
+-			close(fd);
+-			return;
+-		}
+-
+-		/* Report progress */
+-		done_size += rc;
+-		progress_report(false);
+-	}
+-	if (rc < 0)
+-		report_backup_error(context, "could not read file \"%s\": %m",
+-							relpath);
+-
+-	/* Close the file. */
+-	if (close(fd) != 0)
+-	{
+-		report_backup_error(context, "could not close file \"%s\": %m",
+-							relpath);
+-		return;
+-	}
+-
+-	/* If we didn't manage to read the whole file, bail out now. */
+-	if (rc < 0)
+-		return;
+-
+-	/*
+-	 * Double-check that we read the expected number of bytes from the file.
+-	 * Normally, a file size mismatch would be caught in verify_backup_file
+-	 * and this check would never be reached, but this provides additional
+-	 * safety and clarity in the event of concurrent modifications or
+-	 * filesystem misbehavior.
+-	 */
+-	if (bytes_read != m->size)
+-	{
+-		report_backup_error(context,
+-							"file \"%s\" should contain %zu bytes, but read %zu bytes",
+-							relpath, m->size, bytes_read);
+-		return;
+-	}
+-
+-	/* Get the final checksum. */
+-	checksumlen = pg_checksum_final(&checksum_ctx, checksumbuf);
+-	if (checksumlen < 0)
+-	{
+-		report_backup_error(context,
+-							"could not finalize checksum of file \"%s\"",
+-							relpath);
+-		return;
+-	}
+-
+-	/* And check it against the manifest. */
+-	if (checksumlen != m->checksum_length)
+-		report_backup_error(context,
+-							"file \"%s\" has checksum of length %d, but expected %d",
+-							relpath, m->checksum_length, checksumlen);
+-	else if (memcmp(checksumbuf, m->checksum_payload, checksumlen) != 0)
+-		report_backup_error(context,
+-							"checksum mismatch for file \"%s\"",
+-							relpath);
+-}
+-
+-/*
+- * Attempt to parse the WAL files required to restore from backup using
+- * pg_waldump.
+- */
+-static void
+-parse_required_wal(verifier_context *context, char *pg_waldump_path,
+-				   char *wal_directory)
+-{
+-	manifest_data *manifest = context->manifest;
+-	manifest_wal_range *this_wal_range = manifest->first_wal_range;
+-
+-	while (this_wal_range != NULL)
+-	{
+-		char	   *pg_waldump_cmd;
+-
+-		pg_waldump_cmd = psprintf("\"%s\" --quiet --path=\"%s\" --timeline=%u --start=%X/%X --end=%X/%X\n",
+-								  pg_waldump_path, wal_directory, this_wal_range->tli,
+-								  LSN_FORMAT_ARGS(this_wal_range->start_lsn),
+-								  LSN_FORMAT_ARGS(this_wal_range->end_lsn));
+-		fflush(NULL);
+-		if (system(pg_waldump_cmd) != 0)
+-			report_backup_error(context,
+-								"WAL parsing failed for timeline %u",
+-								this_wal_range->tli);
+-
+-		this_wal_range = this_wal_range->next;
+-	}
+-}
+-
+-/*
+- * Report a problem with the backup.
+- *
+- * Update the context to indicate that we saw an error, and exit if the
+- * context says we should.
+- */
+-static void
+-report_backup_error(verifier_context *context, const char *pg_restrict fmt,...)
+-{
+-	va_list		ap;
+-
+-	va_start(ap, fmt);
+-	pg_log_generic_v(PG_LOG_ERROR, PG_LOG_PRIMARY, gettext(fmt), ap);
+-	va_end(ap);
+-
+-	context->saw_any_error = true;
+-	if (context->exit_on_error)
+-		exit(1);
+-}
+-
+-/*
+- * Report a fatal error and exit
+- */
+-static void
+-report_fatal_error(const char *pg_restrict fmt,...)
+-{
+-	va_list		ap;
+-
+-	va_start(ap, fmt);
+-	pg_log_generic_v(PG_LOG_ERROR, PG_LOG_PRIMARY, gettext(fmt), ap);
+-	va_end(ap);
+-
+-	exit(1);
+-}
+-
+-/*
+- * Is the specified relative path, or some prefix of it, listed in the set
+- * of paths to ignore?
+- *
+- * Note that by "prefix" we mean a parent directory; for this purpose,
+- * "aa/bb" is not a prefix of "aa/bbb", but it is a prefix of "aa/bb/cc".
+- */
+-static bool
+-should_ignore_relpath(verifier_context *context, const char *relpath)
+-{
+-	SimpleStringListCell *cell;
+-
+-	for (cell = context->ignore_list.head; cell != NULL; cell = cell->next)
+-	{
+-		const char *r = relpath;
+-		char	   *v = cell->val;
+-
+-		while (*v != '\0' && *r == *v)
+-			++r, ++v;
+-
+-		if (*v == '\0' && (*r == '\0' || *r == '/'))
+-			return true;
+-	}
+-
+-	return false;
+-}
+-
+-/*
+- * Print a progress report based on the global variables.
+- *
+- * Progress report is written at maximum once per second, unless the finished
+- * parameter is set to true.
+- *
+- * If finished is set to true, this is the last progress report. The cursor
+- * is moved to the next line.
+- */
+-static void
+-progress_report(bool finished)
+-{
+-	static pg_time_t last_progress_report = 0;
+-	pg_time_t	now;
+-	int			percent_size = 0;
+-	char		totalsize_str[32];
+-	char		donesize_str[32];
+-
+-	if (!show_progress)
+-		return;
+-
+-	now = time(NULL);
+-	if (now == last_progress_report && !finished)
+-		return;					/* Max once per second */
+-
+-	last_progress_report = now;
+-	percent_size = total_size ? (int) ((done_size * 100 / total_size)) : 0;
+-
+-	snprintf(totalsize_str, sizeof(totalsize_str), UINT64_FORMAT,
+-			 total_size / 1024);
+-	snprintf(donesize_str, sizeof(donesize_str), UINT64_FORMAT,
+-			 done_size / 1024);
+-
+-	fprintf(stderr,
+-			_("%*s/%s kB (%d%%) verified"),
+-			(int) strlen(totalsize_str),
+-			donesize_str, totalsize_str, percent_size);
+-
+-	/*
+-	 * Stay on the same line if reporting to a terminal and we're not done
+-	 * yet.
+-	 */
+-	fputc((!finished && isatty(fileno(stderr))) ? '\r' : '\n', stderr);
+-}
+-
+-/*
+- * Print out usage information and exit.
+- */
+-static void
+-usage(void)
+-{
+-	printf(_("%s verifies a backup against the backup manifest.\n\n"), progname);
+-	printf(_("Usage:\n  %s [OPTION]... BACKUPDIR\n\n"), progname);
+-	printf(_("Options:\n"));
+-	printf(_("  -e, --exit-on-error         exit immediately on error\n"));
+-	printf(_("  -i, --ignore=RELATIVE_PATH  ignore indicated path\n"));
+-	printf(_("  -m, --manifest-path=PATH    use specified path for manifest\n"));
+-	printf(_("  -n, --no-parse-wal          do not try to parse WAL files\n"));
+-	printf(_("  -P, --progress              show progress information\n"));
+-	printf(_("  -q, --quiet                 do not print any output, except for errors\n"));
+-	printf(_("  -s, --skip-checksums        skip checksum verification\n"));
+-	printf(_("  -w, --wal-directory=PATH    use specified path for WAL files\n"));
+-	printf(_("  -V, --version               output version information, then exit\n"));
+-	printf(_("  -?, --help                  show this help, then exit\n"));
+-	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);
+-	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
+-}
++int main(int argc, char *argv[]){return 0;}
+diff --git a/src/bin/psql/command.c b/src/bin/psql/command.c
+index f3f8fd0765..3fb6a4c88c 100644
+--- a/src/bin/psql/command.c
++++ b/src/bin/psql/command.c
+@@ -5242,6 +5242,10 @@ do_shell(const char *command)
+ static bool
+ do_watch(PQExpBuffer query_buf, double sleep, int iter, int min_rows)
+ {
++#if defined(__wasi__)
++    pg_log_error("#5150 wasi: could not set timer");
++    return false;
++#else
+ 	long		sleep_ms = (long) (sleep * 1000);
+ 	printQueryOpt myopt = pset.popt;
+ 	const char *strftime_fmt;
+@@ -5474,6 +5478,7 @@ do_watch(PQExpBuffer query_buf, double sleep, int iter, int min_rows)
+ 
+ 	pg_free(title);
+ 	return (res >= 0);
++#endif /* __wasi__ */
+ }
+ 
+ /*
+diff --git a/src/common/exec.c b/src/common/exec.c
+index 0bee19c1e5..379a67994b 100644
+--- a/src/common/exec.c
++++ b/src/common/exec.c
+@@ -22,7 +22,7 @@
+  * This should be harmless everywhere else.
+  */
+ #define _DARWIN_BETTER_REALPATH
+-
++#define PG_EXEC
+ #ifndef FRONTEND
+ #include "postgres.h"
+ #else
+diff --git a/src/common/logging.c b/src/common/logging.c
+index e9a02e3e46..878853c1c4 100644
+--- a/src/common/logging.c
++++ b/src/common/logging.c
+@@ -19,8 +19,9 @@
+ #include "common/logging.h"
+ 
+ enum pg_log_level __pg_log_level;
+-
++#if !defined(PGL_MAIN)
+ static const char *progname;
++#endif
+ static int	log_flags;
+ 
+ static void (*log_pre_callback) (void);
+diff --git a/src/common/pg_get_line.c b/src/common/pg_get_line.c
+index ea37a35945..d1dfc73033 100644
+--- a/src/common/pg_get_line.c
++++ b/src/common/pg_get_line.c
+@@ -125,7 +125,7 @@ pg_get_line_append(FILE *stream, StringInfo buf,
+ 				   PromptInterruptContext *prompt_ctx)
+ {
+ 	int			orig_len = buf->len;
+-
++#if !defined(__wasi__)
+ 	if (prompt_ctx && sigsetjmp(*((sigjmp_buf *) prompt_ctx->jmpbuf), 1) != 0)
+ 	{
+ 		/* Got here with longjmp */
+@@ -135,7 +135,7 @@ pg_get_line_append(FILE *stream, StringInfo buf,
+ 		buf->data[orig_len] = '\0';
+ 		return false;
+ 	}
+-
++#endif
+ 	/* Loop until newline or EOF/error */
+ 	for (;;)
+ 	{
+diff --git a/src/fe_utils/connect_utils.c b/src/fe_utils/connect_utils.c
+index 5ed9f3ba17..9be315ac02 100644
+--- a/src/fe_utils/connect_utils.c
++++ b/src/fe_utils/connect_utils.c
+@@ -35,7 +35,7 @@ connectDatabase(const ConnParams *cparams, const char *progname,
+ 	PGconn	   *conn;
+ 	bool		new_pass;
+ 	static char *password = NULL;
+-
++puts("# 38:" __FILE__ "\r\n");
+ 	/* Callers must supply at least dbname; other params can be NULL */
+ 	Assert(cparams->dbname);
+ 
+@@ -84,9 +84,9 @@ connectDatabase(const ConnParams *cparams, const char *progname,
+ 		values[i++] = NULL;
+ 		Assert(i <= lengthof(keywords));
+ 
+-		new_pass = false;
++		new_pass = false; puts("# 87:" __FILE__ ": connectDatabase->PQconnectdbParams\r\n");
+ 		conn = PQconnectdbParams(keywords, values, true);
+-
++puts("# 89:" __FILE__ ": connectDatabase<-PQconnectdbParams\r\n");
+ 		if (!conn)
+ 			pg_fatal("could not connect to database %s: out of memory",
+ 					 cparams->dbname);
+@@ -118,7 +118,7 @@ connectDatabase(const ConnParams *cparams, const char *progname,
+ 
+ 	/* Start strict; callers may override this. */
+ 	PQclear(executeQuery(conn, ALWAYS_SECURE_SEARCH_PATH_SQL, echo));
+-
++puts("# 121:" __FILE__ ": connectDatabase->conn\r\n");
+ 	return conn;
+ }
+ 
+diff --git a/src/fe_utils/print.c b/src/fe_utils/print.c
+index d6c4d78f98..8616b4fae2 100644
+--- a/src/fe_utils/print.c
++++ b/src/fe_utils/print.c
+@@ -15,6 +15,7 @@
+  *
+  *-------------------------------------------------------------------------
+  */
++#define FE_UTILS_PRINT
+ #include "postgres_fe.h"
+ 
+ #include <limits.h>
+diff --git a/src/fe_utils/query_utils.c b/src/fe_utils/query_utils.c
+index 4970c4575d..bf755915d6 100644
+--- a/src/fe_utils/query_utils.c
++++ b/src/fe_utils/query_utils.c
+@@ -30,8 +30,8 @@ executeQuery(PGconn *conn, const char *query, bool echo)
+ 	if (!res ||
+ 		PQresultStatus(res) != PGRES_TUPLES_OK)
+ 	{
+-		pg_log_error("query failed: %s", PQerrorMessage(conn));
+-		pg_log_error_detail("Query was: %s", query);
++		pg_log_error("# 33: query failed: %s", PQerrorMessage(conn));
++		pg_log_error_detail("# 34: Query was: %s", query);
+ 		PQfinish(conn);
+ 		exit(1);
+ 	}
+@@ -55,8 +55,8 @@ executeCommand(PGconn *conn, const char *query, bool echo)
+ 	if (!res ||
+ 		PQresultStatus(res) != PGRES_COMMAND_OK)
+ 	{
+-		pg_log_error("query failed: %s", PQerrorMessage(conn));
+-		pg_log_error_detail("Query was: %s", query);
++		pg_log_error("# 58: query failed: %s", PQerrorMessage(conn));
++		pg_log_error_detail("# 59: Query was: %s", query);
+ 		PQfinish(conn);
+ 		exit(1);
+ 	}
+diff --git a/src/fe_utils/string_utils.c b/src/fe_utils/string_utils.c
+index 8e062c7037..f2da2fc842 100644
+--- a/src/fe_utils/string_utils.c
++++ b/src/fe_utils/string_utils.c
+@@ -24,7 +24,9 @@
+ static PQExpBuffer defaultGetLocalPQExpBuffer(void);
+ 
+ /* Globals exported by this file */
+-int			quote_all_identifiers = 0;
++bool			fe_utils_quote_all_identifiers = false;
++
++
+ PQExpBuffer (*getLocalPQExpBuffer) (void) = defaultGetLocalPQExpBuffer;
+ 
+ static int	fmtIdEncoding = -1;
+@@ -110,7 +112,7 @@ fmtIdEnc(const char *rawid, int encoding)
+ 	 * These checks need to match the identifier production in scan.l. Don't
+ 	 * use islower() etc.
+ 	 */
+-	if (quote_all_identifiers)
++	if (fe_utils_quote_all_identifiers)
+ 		need_quotes = true;
+ 	/* slightly different rules for first character */
+ 	else if (!((rawid[0] >= 'a' && rawid[0] <= 'z') || rawid[0] == '_'))
+diff --git a/src/include/bootstrap/bootstrap.h b/src/include/bootstrap/bootstrap.h
+index 73b78b3133..a48899dca4 100644
+--- a/src/include/bootstrap/bootstrap.h
++++ b/src/include/bootstrap/bootstrap.h
+@@ -32,8 +32,11 @@ extern PGDLLIMPORT Relation boot_reldesc;
+ extern PGDLLIMPORT Form_pg_attribute attrtypes[MAXATTR];
+ extern PGDLLIMPORT int numattr;
+ 
+-
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++    int BootstrapModeMain(int argc, char *argv[], bool check_only);
++#else
+ extern void BootstrapModeMain(int argc, char *argv[], bool check_only) pg_attribute_noreturn();
++#endif
+ 
+ extern void closerel(char *relname);
+ extern void boot_openrel(char *relname);
+diff --git a/src/include/common/file_utils.h b/src/include/common/file_utils.h
+index e4339fb7b6..ad07b3cb02 100644
+--- a/src/include/common/file_utils.h
++++ b/src/include/common/file_utils.h
+@@ -33,11 +33,15 @@ typedef enum DataDirSyncMethod
+ struct iovec;					/* avoid including port/pg_iovec.h here */
+ 
+ #ifdef FRONTEND
++#if !defined(fsync_fname)
+ extern int	fsync_fname(const char *fname, bool isdir);
++#endif /* src/include/storage/fd.h */
+ extern void sync_pgdata(const char *pg_data, int serverVersion,
+ 						DataDirSyncMethod sync_method);
+ extern void sync_dir_recurse(const char *dir, DataDirSyncMethod sync_method);
++#if !defined(durable_rename)
+ extern int	durable_rename(const char *oldfile, const char *newfile);
++#endif /* src/include/storage/fd.h */
+ extern int	fsync_parent_path(const char *fname);
+ #endif
+ 
+diff --git a/src/include/common/logging.h b/src/include/common/logging.h
+index afbd9c059a..999615e7aa 100644
+--- a/src/include/common/logging.h
++++ b/src/include/common/logging.h
+@@ -91,7 +91,6 @@ void		pg_logging_set_level(enum pg_log_level new_level);
+ void		pg_logging_increase_verbosity(void);
+ void		pg_logging_set_pre_callback(void (*cb) (void));
+ void		pg_logging_set_locus_callback(void (*cb) (const char **filename, uint64 *lineno));
+-
+ void		pg_log_generic(enum pg_log_level level, enum pg_log_part part,
+ 						   const char *pg_restrict fmt,...)
+ 			pg_attribute_printf(3, 4);
+diff --git a/src/include/fe_utils/string_utils.h b/src/include/fe_utils/string_utils.h
+index 500f585a4a..34c94e603e 100644
+--- a/src/include/fe_utils/string_utils.h
++++ b/src/include/fe_utils/string_utils.h
+@@ -16,11 +16,16 @@
+ #ifndef STRING_UTILS_H
+ #define STRING_UTILS_H
+ 
++#if !defined(__wasi__)
+ #include "libpq-fe.h"
+ #include "pqexpbuffer.h"
++#else
++#include "../interfaces/libpq/libpq-fe.h"
++#include "../interfaces/libpq/pqexpbuffer.h"
++#endif
+ 
+ /* Global variables controlling behavior of fmtId() and fmtQualifiedId() */
+-extern PGDLLIMPORT int quote_all_identifiers;
++extern PGDLLIMPORT bool quote_all_identifiers;
+ extern PQExpBuffer (*getLocalPQExpBuffer) (void);
+ 
+ /* Functions */
+diff --git a/src/include/fmgr.h b/src/include/fmgr.h
+index ccb4070a25..7c960bcc4a 100644
+--- a/src/include/fmgr.h
++++ b/src/include/fmgr.h
+@@ -505,7 +505,10 @@ PG_MAGIC_FUNCTION_NAME(void) \
+ 	return &Pg_magic_data; \
+ } \
+ extern int no_such_variable
+-
++#if defined(__wasi__) && !defined(__EMSCRIPTEN__)
++#undef PG_MODULE_MAGIC
++#define PG_MODULE_MAGIC
++#endif
+ 
+ /*-------------------------------------------------------------------------
+  *		Support routines and macros for callers of fmgr-compatible functions
+diff --git a/src/include/libpq/be-fsstubs.h b/src/include/libpq/be-fsstubs.h
+index 336b9cef12..0d6c7124b5 100644
+--- a/src/include/libpq/be-fsstubs.h
++++ b/src/include/libpq/be-fsstubs.h
+@@ -19,8 +19,10 @@
+  * Probably these should have had the underscore-free names,
+  * but too late now...
+  */
+-extern int	lo_read(int fd, char *buf, int len);
+-extern int	lo_write(int fd, const char *buf, int len);
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
++extern int	lo_read3(int fd, char *buf, int len);
++extern int	lo_write3(int fd, const char *buf, int len);
++#endif
+ 
+ /*
+  * Cleanup LOs at xact commit/abort
+diff --git a/src/include/port/emscripten.h b/src/include/port/emscripten.h
+new file mode 100644
+index 0000000000..db4903aa48
+--- /dev/null
++++ b/src/include/port/emscripten.h
+@@ -0,0 +1,17 @@
++/* src/include/port/{wasi/emscripten}.h */
++
++#ifndef I_WASM
++#define I_WASM
++
++#if !defined(__cplusplus)
++#include <sdk_port.h>
++#endif
++
++#include "/tmp/pglite/include/wasm_common.h"
++
++
++#define BOOT_END_MARK "build indices"
++#define FD_BUFFER_MAX 16384
++
++
++#endif // I_WASM
+diff --git a/src/include/port/pg_pthread.h b/src/include/port/pg_pthread.h
+index d102ce9d6f..6922eb423b 100644
+--- a/src/include/port/pg_pthread.h
++++ b/src/include/port/pg_pthread.h
+@@ -12,7 +12,9 @@
+ 
+ #ifndef PG_PTHREAD_H
+ #define PG_PTHREAD_H
+-
++#if defined(__wasi__)
++#define PYDK
++#endif /* __wasi__ */
+ #include <pthread.h>
+ 
+ #ifndef HAVE_PTHREAD_BARRIER_WAIT
+@@ -20,7 +22,7 @@
+ #ifndef PTHREAD_BARRIER_SERIAL_THREAD
+ #define PTHREAD_BARRIER_SERIAL_THREAD (-1)
+ #endif
+-
++#if !defined(__wasi__)
+ typedef struct pg_pthread_barrier
+ {
+ 	bool		sense;			/* we only need a one bit phase */
+@@ -29,10 +31,12 @@ typedef struct pg_pthread_barrier
+ 	pthread_mutex_t mutex;
+ 	pthread_cond_t cond;
+ } pthread_barrier_t;
+-
+ extern int	pthread_barrier_init(pthread_barrier_t *barrier,
+ 								 const void *attr,
+ 								 int count);
++#else
++    extern int pthread_barrier_init(pthread_barrier_t *__restrict, const pthread_barrierattr_t *__restrict, unsigned);
++#endif
+ extern int	pthread_barrier_wait(pthread_barrier_t *barrier);
+ extern int	pthread_barrier_destroy(pthread_barrier_t *barrier);
+ 
+diff --git a/src/include/port/wasi.h b/src/include/port/wasi.h
+new file mode 100644
+index 0000000000..db4903aa48
+--- /dev/null
++++ b/src/include/port/wasi.h
+@@ -0,0 +1,17 @@
++/* src/include/port/{wasi/emscripten}.h */
++
++#ifndef I_WASM
++#define I_WASM
++
++#if !defined(__cplusplus)
++#include <sdk_port.h>
++#endif
++
++#include "/tmp/pglite/include/wasm_common.h"
++
++
++#define BOOT_END_MARK "build indices"
++#define FD_BUFFER_MAX 16384
++
++
++#endif // I_WASM
+diff --git a/src/include/port/wasm_common.h b/src/include/port/wasm_common.h
+new file mode 100644
+index 0000000000..6f53f0fc5b
+--- /dev/null
++++ b/src/include/port/wasm_common.h
+@@ -0,0 +1,245 @@
++#pragma once
++
++#include <stdio.h> // for FILE
++
++#include <stdlib.h> // for abort
++
++#define WAIT_USE_POLL 1
++
++#define HAVE_LINUX_EIDRM_BUG
++/*
++ * Set the default wal_sync_method to fdatasync.  With recent Linux versions,
++ * xlogdefs.h's normal rules will prefer open_datasync, which (a) doesn't
++ * perform better and (b) causes outright failures on ext4 data=journal
++ * filesystems, because those don't support O_DIRECT.
++ */
++#define PLATFORM_DEFAULT_WAL_SYNC_METHOD	WAL_SYNC_METHOD_FDATASYNC
++
++// force the name used with --single
++#if !defined(WASM_USERNAME)
++#define WASM_USERNAME "postgres"
++#endif
++
++
++
++/* --------------- how to configure those when installed ? ---------------- */
++
++// socket emulation via file, need to go in PGDATA for nodefs mount in web mode
++#define PGS_ILOCK "/tmp/pglite/base/.s.PGSQL.5432.lock.in"
++#define PGS_IN    "/tmp/pglite/base/.s.PGSQL.5432.in"
++#define PGS_OLOCK "/tmp/pglite/base/.s.PGSQL.5432.lock.out"
++#define PGS_OUT   "/tmp/pglite/base/.s.PGSQL.5432.out"
++
++
++
++#if defined(PG_PREFIX)
++#define em_xstr(s) em_str(s)
++#define em_str(s) #s
++#   define WASM_PREFIX em_xstr(PG_PREFIX)
++#   define PG_MAIN_INCLUDE em_xstr(PATCH_MAIN)
++#   define PG_PLUGIN_INCLUDE em_xstr(PATCH_PLUGIN
++#   undef PG_PREFIX
++#else
++#   define WASM_PREFIX "/pgdata"
++#   define PG_MAIN_INCLUDE "/pgdata/pg_main.c"
++#   define PG_PLUGIN_INCLUDE "/pgdata/pg_plugin.h"
++#endif
++
++#include "pg_debug.h"
++
++// #define COPY_INTERNAL
++#define COPY_OFF
++#define PGDLLIMPORT
++#define PG_FORCE_DISABLE_INLINE
++
++
++#define WASM_PGOPTS \
++        "-c", "log_checkpoints=false",\
++        "-c", "search_path=pg_catalog",\
++        "-c", "exit_on_error=true",\
++        "-c", "ignore_invalid_pages=on",\
++        "-c", "temp_buffers=8MB",\
++        "-c", "work_mem=4MB",\
++        "-c", "fsync=on",\
++        "-c", "synchronous_commit=on",\
++        "-c", "wal_buffers=4MB",\
++        "-c", "min_wal_size=80MB",\
++        "-c", "shared_buffers=128MB"
++
++// we want client and server in the same lib for now.
++#if defined(PG_INITDB) && defined(PG_MAIN)
++extern const char *progname;
++#endif
++
++// exported in ./src/fe_utils/string_utils.c
++#include <stdbool.h>
++extern PGDLLIMPORT bool fe_utils_quote_all_identifiers;
++
++extern int	pg_char_to_encoding_private(const char *name);
++extern const char *pg_encoding_to_char_private(int encoding);
++extern int	pg_valid_server_encoding_id_private(int encoding);
++
++
++#if defined(pg_char_to_encoding)
++#undef pg_char_to_encoding
++#endif
++#define pg_char_to_encoding(encoding) pg_char_to_encoding_private(encoding)
++
++#if defined(pg_encoding_to_char)
++#undef pg_encoding_to_char
++#endif
++#define pg_encoding_to_char(encoding) pg_encoding_to_char_private(encoding)
++
++#if defined(pg_valid_server_encoding_id)
++#undef pg_valid_server_encoding_id
++#endif
++#define pg_valid_server_encoding_id(encoding) pg_valid_server_encoding_id_private(encoding)
++
++
++/*
++ * 'proc_exit' is a wasi system call, so change its name everywhere.
++ */
++
++#define proc_exit(arg) pg_proc_exit(arg)
++
++/*
++extern FILE* IDB_PIPE_FP;
++extern int IDB_STAGE;
++*/
++extern FILE* SOCKET_FILE;
++extern int SOCKET_DATA;
++extern int pgl_pclose(FILE *stream);
++/*
++#if !defined(PGL_MAIN) && !defined(PGL_INITDB_MAIN)
++#   if !defined(PG_EXEC)
++extern int pgl_pclose(FILE *stream);
++#define pclose(stream) pg_pclose(stream)
++#   else
++#if 1
++#include <stdio.h>
++int
++pg_pclose(FILE *stream) {
++    puts("# 118:" __FILE__ " int pg_pclose(FILE *stream) STUB");
++    return 0;
++}
++#endif
++#   endif  // PG_EXEC
++#endif  // pgl
++*/
++
++/*
++ * OpenPipeStream : another kind of pipe open in fd.c
++ * known to try "locale -a" from collationcmds.c when in initdb.
++ *
++ */
++#if defined(PG_FD)
++#include <string.h>  // strlen
++#include <unistd.h> // access+F_OK
++#include <stdio.h> // FILE+fprintf
++
++FILE *wasm_OpenPipeStream(const char *command, const char *mode);
++FILE *
++wasm_OpenPipeStream(const char *command, const char *mode) {
++
++    FILE *result = NULL;
++    const char *prefix = getenv("PGSYSCONFDIR");
++    const char *locale = "/locale";
++    char *localefile = malloc( strlen(prefix) + strlen(locale) + 1 );
++    localefile = strcat(prefix,locale);
++#if PGDEBUG
++    fprintf(stderr, "# 232:%s: OpenPipeStream(command=%s, mode=%s)\n#\tredirected to %s\n", __FILE__, command, mode, localefile);
++#endif
++    if (localefile) {
++        if (access(localefile, F_OK) != 0) {
++            FILE *fakeloc = fopen(localefile, "w");
++            {
++                const char* encoding = getenv("PGCLIENTENCODING");
++                fprintf(fakeloc, "C\nC.%s\nPOSIX\n%s\n", encoding, encoding);
++            }
++            if (fakeloc)
++                fclose(fakeloc);
++        }
++        result = fopen(localefile, "r");
++        free(localefile);
++    }
++
++    return result;
++}
++
++#else
++#   define OpenPipeStream(cmd, mode) wasm_OpenPipeStream(cmd, mode)
++#endif
++
++
++
++
++
++
++/*
++ *  handle pg_shmem.c special case
++ */
++
++#if defined(PG_SHMEM)
++#include <stdio.h>  // print
++#include <stdlib.h> // malloc
++#include <unistd.h> // SC_
++#include <sys/shm.h>
++#include <sys/stat.h>
++
++/*
++ * Shared memory control operation.
++ */
++
++//extern int shmctl (int __shmid, int __cmd, struct shmid_ds *__buf);
++
++int
++shmctl (int __shmid, int __cmd, struct shmid_ds *__buf) {
++	printf("FIXME: int shmctl (int __shmid=%d, int __cmd=%d, struct shmid_ds *__buf=%p)\n", __shmid, __cmd, __buf);
++	return 0;
++}
++
++
++volatile void *FAKE_SHM ;
++volatile key_t FAKE_KEY = 0;
++
++/* Get shared memory segment.  */
++// extern int shmget (key_t __key, size_t __size, int __shmflg);
++int
++shmget (key_t __key, size_t __size, int __shmflg) {
++	printf("# FIXING: int shmget (key_t __key=%d, size_t __size=%zu, int __shmflg=%d) pagesize default=%d\n", __key, __size, __shmflg, getpagesize());
++    if (!FAKE_KEY) {
++    	FAKE_SHM =  malloc(__size);
++        FAKE_KEY = 666;
++        return (int)FAKE_KEY;
++    } else {
++    	printf("# ERROR: int shmget (key_t __key=%d, size_t __size=%zu, int __shmflg=%d)\n", __key, __size, __shmflg);
++        //abort();
++        return (int)FAKE_KEY;
++    }
++	return -1;
++}
++
++/* Attach shared memory segment.  */
++// extern void *shmat (int __shmid, const void *__shmaddr, int __shmflg);
++void *shmat (int __shmid, const void *__shmaddr, int __shmflg) {
++	printf("# FIXING: void *shmat (int __shmid=%d, const void *__shmaddr=%p, int __shmflg=%d)\n", __shmid, __shmaddr, __shmflg);
++	if (__shmid==666) {
++		return (void *)FAKE_SHM;
++    } else {
++    	printf("# ERROR: void *shmat (int __shmid=%d, const void *__shmaddr=%p, int __shmflg=%d)\n", __shmid, __shmaddr, __shmflg);
++        abort();
++    }
++	return NULL;
++}
++
++/* Detach shared memory segment.  */
++// extern int shmdt (const void *__shmaddr);
++int
++shmdt (const void *__shmaddr) {
++	puts("# FIXME: int shmdt (const void *__shmaddr)");
++	return 0;
++}
++
++
++#endif // PG_SHMEM
++
+diff --git a/src/include/storage/dsm_impl.h b/src/include/storage/dsm_impl.h
+index 882269603d..5246c84161 100644
+--- a/src/include/storage/dsm_impl.h
++++ b/src/include/storage/dsm_impl.h
+@@ -23,20 +23,49 @@
+  * Determine which dynamic shared memory implementations will be supported
+  * on this platform, and which one will be the default.
+  */
++#if 0 // defined(__wasi__) || defined(__EMSCRIPTEN__)
++    #define DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE		DSM_IMPL_SYSV
++    #define USE_DSM_SYSV
++    extern PGDLLIMPORT int dynamic_shared_memory_type;
++    extern PGDLLIMPORT int min_dynamic_shared_memory;
++    #define PG_DYNSHMEM_DIR					"/tmp/pglite"
++    #define PG_DYNSHMEM_MMAP_FILE_PREFIX	"mmap."
++
++#elif 0 // defined(__wasi__) || defined(__EMSCRIPTEN__)
++    #define DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE		DSM_IMPL_MMAP
++    #define USE_DSM_MMAP
++    extern PGDLLIMPORT int dynamic_shared_memory_type;
++    extern PGDLLIMPORT int min_dynamic_shared_memory;
++    #define PG_DYNSHMEM_DIR					"/tmp/pglite"
++    #define PG_DYNSHMEM_MMAP_FILE_PREFIX	"mmap."
++
++#elif defined(__wasi__) || defined(__EMSCRIPTEN__)
++    #define DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE		DSM_IMPL_POSIX
++    #define USE_DSM_POSIX
++    extern PGDLLIMPORT int dynamic_shared_memory_type;
++    extern PGDLLIMPORT int min_dynamic_shared_memory;
++    #define PG_DYNSHMEM_DIR					"/tmp/pglite"
++    #define PG_DYNSHMEM_MMAP_FILE_PREFIX	"mmap."
++
++#else
++
+ #ifdef WIN32
+-#define USE_DSM_WINDOWS
+-#define DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE		DSM_IMPL_WINDOWS
++#   define USE_DSM_WINDOWS
++#   define DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE		DSM_IMPL_WINDOWS
+ #else
+-#ifdef HAVE_SHM_OPEN
+-#define USE_DSM_POSIX
+-#define DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE		DSM_IMPL_POSIX
+-#endif
+-#define USE_DSM_SYSV
+-#ifndef DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE
+-#define DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE		DSM_IMPL_SYSV
+-#endif
++#   ifdef HAVE_SHM_OPEN
++#       define USE_DSM_POSIX
++#       define DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE		DSM_IMPL_POSIX
++#   endif
++#   define USE_DSM_SYSV
++#   ifndef DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE
++#       define DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE		DSM_IMPL_SYSV
++#   endif
+ #define USE_DSM_MMAP
+-#endif
++
++#endif /* defined(__wasi__) || defined(__EMSCRIPTEN__) */
++
++
+ 
+ /* GUC. */
+ extern PGDLLIMPORT int dynamic_shared_memory_type;
+@@ -50,7 +79,7 @@ extern PGDLLIMPORT int min_dynamic_shared_memory;
+  */
+ #define PG_DYNSHMEM_DIR					"pg_dynshmem"
+ #define PG_DYNSHMEM_MMAP_FILE_PREFIX	"mmap."
+-
++#endif
+ /* A "name" for a dynamic shared memory segment. */
+ typedef uint32 dsm_handle;
+ 
+diff --git a/src/include/storage/fd.h b/src/include/storage/fd.h
+index 1456ab383a..880f53ace4 100644
+--- a/src/include/storage/fd.h
++++ b/src/include/storage/fd.h
+@@ -185,13 +185,23 @@ extern int	pg_fdatasync(int fd);
+ extern bool pg_file_exists(const char *name);
+ extern void pg_flush_data(int fd, off_t offset, off_t nbytes);
+ extern int	pg_truncate(const char *path, off_t length);
+-extern void fsync_fname(const char *fname, bool isdir);
++/* extern void fsync_fname(const char *fname, bool isdir);
++ * does not match ./src/common/file_utils.c
++ */
++extern void fd_fsync_fname(const char *fname, bool isdir);
+ extern int	fsync_fname_ext(const char *fname, bool isdir, bool ignore_perm, int elevel);
+-extern int	durable_rename(const char *oldfile, const char *newfile, int elevel);
++
++/* extern int	durable_rename(const char *oldfile, const char *newfile, int elevel);
++ * does not mach ./src/common/file_utils.c
++ */
++extern int	fd_durable_rename(const char *oldfile, const char *newfile, int elevel);
+ extern int	durable_unlink(const char *fname, int elevel);
+ extern void SyncDataDirectory(void);
+ extern int	data_sync_elevel(int elevel);
+ 
++#define durable_rename(oldfile, newfile, elevel) fd_durable_rename(oldfile, newfile, elevel)
++#define fsync_fname(fname, isdir) fd_fsync_fname(fname, isdir)
++
+ static inline ssize_t
+ FileRead(File file, void *buffer, size_t amount, off_t offset,
+ 		 uint32 wait_event_info)
+diff --git a/src/include/storage/ipc.h b/src/include/storage/ipc.h
+index b2d062781e..d5aebb72dc 100644
+--- a/src/include/storage/ipc.h
++++ b/src/include/storage/ipc.h
+@@ -64,8 +64,11 @@ typedef void (*shmem_startup_hook_type) (void);
+ /* ipc.c */
+ extern PGDLLIMPORT bool proc_exit_inprogress;
+ extern PGDLLIMPORT bool shmem_exit_inprogress;
+-
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++extern void pg_proc_exit(int code);
++#else
+ extern void proc_exit(int code) pg_attribute_noreturn();
++#endif
+ extern void shmem_exit(int code);
+ extern void on_proc_exit(pg_on_exit_callback function, Datum arg);
+ extern void on_shmem_exit(pg_on_exit_callback function, Datum arg);
+diff --git a/src/include/utils/elog.h b/src/include/utils/elog.h
+index e54eca5b48..751a6a414e 100644
+--- a/src/include/utils/elog.h
++++ b/src/include/utils/elog.h
+@@ -137,6 +137,19 @@ struct Node;
+  * prevents gcc from making the unreachability deduction at optlevel -O0.
+  *----------
+  */
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++#define ereport_domain(elevel, domain, ...)	\
++	do { \
++		pg_prevent_errno_in_scope(); \
++		if (__builtin_constant_p(elevel) && (elevel) >= ERROR ? \
++			errstart_cold(elevel, domain) : \
++			errstart(elevel, domain)) \
++			__VA_ARGS__, errfinish(__FILE__, __LINE__, __func__); \
++		if (__builtin_constant_p(elevel) && (elevel) >= ERROR) \
++			{ puts("# 149:pg_unreachable():" __FILE__); pg_unreachable(); } \
++	} while(0)
++
++#else
+ #ifdef HAVE__BUILTIN_CONSTANT_P
+ #define ereport_domain(elevel, domain, ...)	\
+ 	do { \
+@@ -159,7 +172,7 @@ struct Node;
+ 			pg_unreachable(); \
+ 	} while(0)
+ #endif							/* HAVE__BUILTIN_CONSTANT_P */
+-
++#endif
+ #define ereport(elevel, ...)	\
+ 	ereport_domain(elevel, TEXTDOMAIN, __VA_ARGS__)
+ 
+diff --git a/src/include/utils/palloc.h b/src/include/utils/palloc.h
+index 773a5d2c34..39f4e429ed 100644
+--- a/src/include/utils/palloc.h
++++ b/src/include/utils/palloc.h
+@@ -56,7 +56,9 @@ typedef struct MemoryContextCallback
+  * Avoid accessing it directly!  Instead, use MemoryContextSwitchTo()
+  * to change the setting.
+  */
++#if !defined(PG_EXTERN)
+ extern PGDLLIMPORT MemoryContext CurrentMemoryContext;
++#endif
+ 
+ /*
+  * Flags for MemoryContextAllocExtended.
+@@ -118,7 +120,7 @@ extern pg_nodiscard void *repalloc_huge(void *pointer, Size size);
+  * it's necessary to hide the inline definition of MemoryContextSwitchTo in
+  * this scenario; hence the #ifndef FRONTEND.
+  */
+-
++#if !defined(PG_EXTERN)
+ #ifndef FRONTEND
+ static inline MemoryContext
+ MemoryContextSwitchTo(MemoryContext context)
+@@ -129,7 +131,8 @@ MemoryContextSwitchTo(MemoryContext context)
+ 	return old;
+ }
+ #endif							/* FRONTEND */
+-
++#else
++#endif
+ /* Registration of memory context reset/delete callbacks */
+ extern void MemoryContextRegisterResetCallback(MemoryContext context,
+ 											   MemoryContextCallback *cb);
+diff --git a/src/interfaces/libpq/legacy-pqsignal.c b/src/interfaces/libpq/legacy-pqsignal.c
+index 6db349bcbc..9c69f38907 100644
+--- a/src/interfaces/libpq/legacy-pqsignal.c
++++ b/src/interfaces/libpq/legacy-pqsignal.c
+@@ -36,8 +36,8 @@
+  * is to ensure that no in-tree code accidentally calls this version.)
+  */
+ #undef pqsignal
++#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ extern pqsigfunc pqsignal(int signo, pqsigfunc func);
+-
+ pqsigfunc
+ pqsignal(int signo, pqsigfunc func)
+ {
+@@ -61,3 +61,4 @@ pqsignal(int signo, pqsigfunc func)
+ 	return signal(signo, func);
+ #endif
+ }
++#endif /* __EMSCRIPTEN__ || __wasi__ */
+diff --git a/src/makefiles/Makefile.emscripten b/src/makefiles/Makefile.emscripten
+new file mode 100644
+index 0000000000..3d37d043ad
+--- /dev/null
++++ b/src/makefiles/Makefile.emscripten
+@@ -0,0 +1,16 @@
++# Use --enable-new-dtags to generate DT_RUNPATH instead of DT_RPATH.
++# This allows LD_LIBRARY_PATH to still work when needed.
++rpath = 
++AROPT = crs
++
++# Rule for building a shared library from a single .o file
++%.so: %.o
++	$(CC) $(CFLAGS) $< $(LDFLAGS) $(LDFLAGS_SL) -shared -o $@
++# Use --enable-new-dtags to generate DT_RUNPATH instead of DT_RPATH.
++# This allows LD_LIBRARY_PATH to still work when needed.
++rpath = 
++AROPT = crs
++
++# Rule for building a shared library from a single .o file
++%.so: %.o
++	$(CC) $(CFLAGS) $< $(LDFLAGS) $(LDFLAGS_SL) -shared -o $@
+diff --git a/src/makefiles/Makefile.wasi b/src/makefiles/Makefile.wasi
+new file mode 100644
+index 0000000000..3d37d043ad
+--- /dev/null
++++ b/src/makefiles/Makefile.wasi
+@@ -0,0 +1,16 @@
++# Use --enable-new-dtags to generate DT_RUNPATH instead of DT_RPATH.
++# This allows LD_LIBRARY_PATH to still work when needed.
++rpath = 
++AROPT = crs
++
++# Rule for building a shared library from a single .o file
++%.so: %.o
++	$(CC) $(CFLAGS) $< $(LDFLAGS) $(LDFLAGS_SL) -shared -o $@
++# Use --enable-new-dtags to generate DT_RUNPATH instead of DT_RPATH.
++# This allows LD_LIBRARY_PATH to still work when needed.
++rpath = 
++AROPT = crs
++
++# Rule for building a shared library from a single .o file
++%.so: %.o
++	$(CC) $(CFLAGS) $< $(LDFLAGS) $(LDFLAGS_SL) -shared -o $@
+diff --git a/src/port/getpeereid.c b/src/port/getpeereid.c
+index f1fef91631..09f86bfc2c 100644
+--- a/src/port/getpeereid.c
++++ b/src/port/getpeereid.c
+@@ -32,7 +32,11 @@
+ int
+ getpeereid(int sock, uid_t *uid, gid_t *gid)
+ {
+-#if defined(SO_PEERCRED)
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
++	/* No implementation available on this platform */
++	errno = ENOSYS;
++	return -1;
++#elif defined(SO_PEERCRED)
+ 	/* Linux: use getsockopt(SO_PEERCRED) */
+ 	struct ucred peercred;
+ 	socklen_t	so_len = sizeof(peercred);
+diff --git a/src/port/pqsignal.c b/src/port/pqsignal.c
+index 9dadce8357..520c5ba1e4 100644
+--- a/src/port/pqsignal.c
++++ b/src/port/pqsignal.c
+@@ -173,3 +173,4 @@ pqsignal(int signo, pqsigfunc func)
+ 		return ret;
+ #endif
+ }
++
+diff --git a/src/port/pthread_barrier_wait.c b/src/port/pthread_barrier_wait.c
+index 835dbf1c7a..e9d45647da 100644
+--- a/src/port/pthread_barrier_wait.c
++++ b/src/port/pthread_barrier_wait.c
+@@ -14,7 +14,7 @@
+ #include "c.h"
+ 
+ #include "port/pg_pthread.h"
+-
++#if !defined(__wasi__)
+ int
+ pthread_barrier_init(pthread_barrier_t *barrier, const void *attr, int count)
+ {
+@@ -75,3 +75,20 @@ pthread_barrier_destroy(pthread_barrier_t *barrier)
+ 	pthread_mutex_destroy(&barrier->mutex);
+ 	return 0;
+ }
++#else
++int
++pthread_barrier_init(pthread_barrier_t *__restrict barrier, const pthread_barrierattr_t *__restrict attr, unsigned count) {
++    return 0;
++}
++
++int
++pthread_barrier_wait(pthread_barrier_t *barrier) {
++    return 0;
++}
++
++int
++pthread_barrier_destroy(pthread_barrier_t *barrier) {
++    return 0;
++}
++#endif
++
+diff --git a/src/template/emscripten b/src/template/emscripten
+new file mode 100644
+index 0000000000..da36f9bf30
+--- /dev/null
++++ b/src/template/emscripten
+@@ -0,0 +1,56 @@
++# src/template/emscripten
++
++# Prefer unnamed POSIX semaphores if available, unless user overrides choice
++if test x"$PREFERRED_SEMAPHORES" = x"" ; then
++  PREFERRED_SEMAPHORES=UNNAMED_POSIX
++fi
++
++# Force _GNU_SOURCE on; plperl is broken with Perl 5.8.0 otherwise
++# This is also required for ppoll(2), and perhaps other things
++CPPFLAGS="$CPPFLAGS -D_GNU_SOURCE"
++
++# Extra CFLAGS for code that will go into a shared library
++CFLAGS_SL="-fPIC"
++
++# src/template/emscripten
++
++# Prefer unnamed POSIX semaphores if available, unless user overrides choice
++if test x"$PREFERRED_SEMAPHORES" = x"" ; then
++  PREFERRED_SEMAPHORES=UNNAMED_POSIX
++fi
++
++# Force _GNU_SOURCE on; plperl is broken with Perl 5.8.0 otherwise
++# This is also required for ppoll(2), and perhaps other things
++CPPFLAGS="$CPPFLAGS -D_GNU_SOURCE"
++
++# Extra CFLAGS for code that will go into a shared library
++CFLAGS_SL="-fPIC"
++
++# src/template/emscripten
++
++# Prefer unnamed POSIX semaphores if available, unless user overrides choice
++if test x"$PREFERRED_SEMAPHORES" = x"" ; then
++  PREFERRED_SEMAPHORES=UNNAMED_POSIX
++fi
++
++# Force _GNU_SOURCE on; plperl is broken with Perl 5.8.0 otherwise
++# This is also required for ppoll(2), and perhaps other things
++CPPFLAGS="$CPPFLAGS -D_GNU_SOURCE"
++
++# Extra CFLAGS for code that will go into a shared library
++CFLAGS_SL="-fPIC"
++
++# src/template/emscripten
++
++# Prefer unnamed POSIX semaphores if available, unless user overrides choice
++if test x"$PREFERRED_SEMAPHORES" = x"" ; then
++  PREFERRED_SEMAPHORES=UNNAMED_POSIX
++fi
++
++# Force _GNU_SOURCE on; plperl is broken with Perl 5.8.0 otherwise
++# This is also required for ppoll(2), and perhaps other things
++CPPFLAGS="$CPPFLAGS -D_GNU_SOURCE"
++
++# Extra CFLAGS for code that will go into a shared library
++CFLAGS_SL="-fPIC"
++
+diff --git a/src/template/wasi b/src/template/wasi
+new file mode 100644
+index 0000000000..dc3dc340ce
+--- /dev/null
++++ b/src/template/wasi
+@@ -0,0 +1,28 @@
++# src/template/emscripten
++
++# Prefer unnamed POSIX semaphores if available, unless user overrides choice
++if test x"$PREFERRED_SEMAPHORES" = x"" ; then
++  PREFERRED_SEMAPHORES=UNNAMED_POSIX
++fi
++
++# Force _GNU_SOURCE on; plperl is broken with Perl 5.8.0 otherwise
++# This is also required for ppoll(2), and perhaps other things
++CPPFLAGS="$CPPFLAGS -D_GNU_SOURCE"
++
++# Extra CFLAGS for code that will go into a shared library
++CFLAGS_SL="-fPIC"
++
++# src/template/emscripten
++
++# Prefer unnamed POSIX semaphores if available, unless user overrides choice
++if test x"$PREFERRED_SEMAPHORES" = x"" ; then
++  PREFERRED_SEMAPHORES=UNNAMED_POSIX
++fi
++
++# Force _GNU_SOURCE on; plperl is broken with Perl 5.8.0 otherwise
++# This is also required for ppoll(2), and perhaps other things
++CPPFLAGS="$CPPFLAGS -D_GNU_SOURCE"
++
++# Extra CFLAGS for code that will go into a shared library
++CFLAGS_SL="-fPIC"
++
+diff --git a/src/test/modules/libpq_pipeline/libpq_pipeline.c b/src/test/modules/libpq_pipeline/libpq_pipeline.c
+index ac4d26302c..0809e67ace 100644
+--- a/src/test/modules/libpq_pipeline/libpq_pipeline.c
++++ b/src/test/modules/libpq_pipeline/libpq_pipeline.c
+@@ -334,7 +334,7 @@ test_cancel(PGconn *conn)
+ 			{
+ 				if (errno == EINTR)
+ 					continue;
+-				pg_fatal("select() failed: %m");
++				pg_fatal("# 337:" __FILE__ ": select() failed: %m");
+ 			}
+ 			break;
+ 		}
+@@ -391,7 +391,7 @@ test_cancel(PGconn *conn)
+ 			{
+ 				if (errno == EINTR)
+ 					continue;
+-				pg_fatal("select() failed: %m");
++				pg_fatal("# 394:" __FILE__ ": select() failed: %m");
+ 			}
+ 			break;
+ 		}
+@@ -643,7 +643,7 @@ test_nosync(PGconn *conn)
+ 		tv.tv_usec = 0;
+ 		if (select(sock + 1, &input_mask, NULL, NULL, &tv) < 0)
+ 		{
+-			fprintf(stderr, "select() failed: %m\n");
++			fprintf(stderr, "# 646:" __FILE__ ": select() failed: %m\n");
+ 			exit_nicely(conn);
+ 		}
+ 		if (FD_ISSET(sock, &input_mask) && PQconsumeInput(conn) != 1)
+@@ -1094,7 +1094,7 @@ test_pipelined_insert(PGconn *conn, int n_rows)
+ 
+ 		if (select(sock + 1, &input_mask, &output_mask, NULL, NULL) < 0)
+ 		{
+-			fprintf(stderr, "select() failed: %m\n");
++			fprintf(stderr, "# 1097:" __FILE__ ": select() failed: %m\n");
+ 			exit_nicely(conn);
+ 		}
+ 
+@@ -2010,7 +2010,7 @@ test_uniqviol(PGconn *conn)
+ 		{
+ 			if (errno == EINTR)
+ 				continue;
+-			pg_fatal("select() failed: %m");
++			pg_fatal("# 2013:" __FILE__ ": select() failed: %m");
+ 		}
+ 
+ 		if (FD_ISSET(sock, &in_fds) && PQconsumeInput(conn) == 0)
+diff --git a/src/test/regress/GNUmakefile b/src/test/regress/GNUmakefile
+index 090e49ea55..b6f20ef887 100644
+--- a/src/test/regress/GNUmakefile
++++ b/src/test/regress/GNUmakefile
+@@ -17,6 +17,14 @@ subdir = src/test/regress
+ top_builddir = ../../..
+ include $(top_builddir)/src/Makefile.global
+ 
++ifeq ($(PORTNAME), emscripten)
++
++all: $(echo "src/test/regress skipped")
++clean check installcheck all-src-recurse: all
++install: all
++else
++
++
+ # maximum simultaneous connections for parallel tests
+ MAXCONNOPT =
+ ifdef MAX_CONNECTIONS
+@@ -152,3 +160,5 @@ clean distclean: clean-lib
+ 	rm -f pg_regress_main.o pg_regress.o pg_regress$(X)
+ # things created by various check targets
+ 	rm -rf $(pg_regress_clean_files)
++
++endif
+diff --git a/src/test/regress/pg_regress.c b/src/test/regress/pg_regress.c
+index 53435c4742..fdf634502a 100644
+--- a/src/test/regress/pg_regress.c
++++ b/src/test/regress/pg_regress.c
+@@ -38,6 +38,15 @@
+ #include "pg_regress.h"
+ #include "portability/instr_time.h"
+ 
++#if defined(__wasi__)
++#if defined(HAVE_GETRLIMIT)
++#undef HAVE_GETRLIMIT
++#endif
++#define execl(...) (-1)
++#define wait(...) (INVALID_PID)
++#define raise(...)
++#endif /* __wasi__ */
++
+ /* for resultmap we need a list of pairs of strings */
+ typedef struct _resultmap
+ {
