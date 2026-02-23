@@ -1,5 +1,6 @@
 # Build artifacts
 build/
+out/
 *.o
 *.so
 *.a
@@ -18,6 +19,11 @@ sdk/
 *.aab
 *.dex
 
+# Gradle caches
+.gradle/
+**/build/
+local.properties
+
 # Local env overrides
 .env
 
@@ -26,3 +32,6 @@ upstream/
 
 # Cross-compiled third-party dependencies (built locally, not committed)
 deps/
+
+# Test binaries
+test_pgandroid
