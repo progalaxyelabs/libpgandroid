@@ -24,6 +24,7 @@ ARCH="arm64-v8a"
 CLEAN=false
 DEBUG=false
 JOBS=$(nproc)
+CUSTOM_PG_SRC=""
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -55,13 +56,23 @@ while [[ $# -gt 0 ]]; do
             JOBS="${1#*=}"
             shift
             ;;
+        --pg-src)
+            CUSTOM_PG_SRC="$2"
+            shift 2
+            ;;
+        --pg-src=*)
+            CUSTOM_PG_SRC="${1#*=}"
+            shift
+            ;;
         -h|--help)
-            echo "Usage: $0 [--arch arm64-v8a|x86_64] [--clean] [--debug] [--jobs N]"
+            echo "Usage: $0 [--arch arm64-v8a|x86_64] [--clean] [--debug] [--jobs N] [--pg-src DIR]"
             echo ""
-            echo "  --arch    Target ABI (default: arm64-v8a)"
-            echo "  --clean   Remove build directory before building"
-            echo "  --debug   Keep debug symbols, disable optimisations"
-            echo "  --jobs N  Parallel jobs (default: nproc)"
+            echo "  --arch      Target ABI (default: arm64-v8a)"
+            echo "  --clean     Remove build directory before building"
+            echo "  --debug     Keep debug symbols, disable optimisations"
+            echo "  --jobs N    Parallel jobs (default: nproc)"
+            echo "  --pg-src    Use custom PostgreSQL source (e.g. postgres-pgandroid)"
+            echo "              Skips upstream copy + patch application."
             exit 0
             ;;
         *)
@@ -169,12 +180,20 @@ if [[ ! -d "$OPENSSL_DIR/include" ]] || [[ ! -d "$OPENSSL_DIR/lib" ]]; then
     exit 1
 fi
 
-if [[ ! -d "$PROJECT/upstream/postgres-pglite" ]]; then
-    echo "ERROR: postgres-pglite source not found at $PROJECT/upstream/postgres-pglite" >&2
-    echo "Clone it first:" >&2
-    echo "  git clone https://github.com/electric-sql/postgres-pglite.git upstream/postgres-pglite" >&2
-    echo "  git -C upstream/postgres-pglite checkout REL_17_5_WASM" >&2
-    exit 1
+if [[ -z "$CUSTOM_PG_SRC" ]]; then
+    if [[ ! -d "$PROJECT/upstream/postgres-pglite" ]]; then
+        echo "ERROR: postgres-pglite source not found at $PROJECT/upstream/postgres-pglite" >&2
+        echo "Clone it first:" >&2
+        echo "  git clone https://github.com/electric-sql/postgres-pglite.git upstream/postgres-pglite" >&2
+        echo "  git -C upstream/postgres-pglite checkout REL_17_5_WASM" >&2
+        echo "Or use --pg-src to specify a custom PostgreSQL source (e.g. postgres-pgandroid)." >&2
+        exit 1
+    fi
+else
+    if [[ ! -d "$CUSTOM_PG_SRC/src/backend" ]]; then
+        echo "ERROR: Custom PG source does not look like a PostgreSQL tree: $CUSTOM_PG_SRC" >&2
+        exit 1
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -210,19 +229,29 @@ mkdir -p "$BUILD_DIR" "$OUT_DIR"
 # Prepare source (working copy)
 # ---------------------------------------------------------------------------
 
-if [[ ! -d "$PG_SRC/src/backend" ]]; then
-    echo "[source] Copying upstream/postgres-pglite -> build/pg-src ..."
-    cp -a "$PROJECT/upstream/postgres-pglite" "$PG_SRC"
-fi
-
-# Apply patches if not already applied (detect via sentinel file)
-PATCH_SENTINEL="$PG_SRC/.pgandroid-patches-applied"
-if [[ ! -f "$PATCH_SENTINEL" ]]; then
-    echo "[patches] Applying pgandroid patches ..."
-    "$PROJECT/patches/apply.sh" --postgres-src "$PG_SRC"
-    touch "$PATCH_SENTINEL"
+if [[ -n "$CUSTOM_PG_SRC" ]]; then
+    # v2: Use custom PG source (e.g. postgres-pgandroid) with changes baked in.
+    # Symlink or copy to build/pg-src.
+    if [[ ! -d "$PG_SRC/src/backend" ]]; then
+        echo "[source] Linking custom PG source: $CUSTOM_PG_SRC -> build/pg-src ..."
+        ln -sfn "$(realpath "$CUSTOM_PG_SRC")" "$PG_SRC"
+    fi
+    echo "[patches] Using custom PG source — patches already applied."
 else
-    echo "[patches] Patches already applied (sentinel found), skipping."
+    if [[ ! -d "$PG_SRC/src/backend" ]]; then
+        echo "[source] Copying upstream/postgres-pglite -> build/pg-src ..."
+        cp -a "$PROJECT/upstream/postgres-pglite" "$PG_SRC"
+    fi
+
+    # Apply patches if not already applied (detect via sentinel file)
+    PATCH_SENTINEL="$PG_SRC/.pgandroid-patches-applied"
+    if [[ ! -f "$PATCH_SENTINEL" ]]; then
+        echo "[patches] Applying pgandroid patches ..."
+        "$PROJECT/patches/apply.sh" --postgres-src "$PG_SRC"
+        touch "$PATCH_SENTINEL"
+    else
+        echo "[patches] Patches already applied (sentinel found), skipping."
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -338,7 +367,7 @@ fi
     "-D__ANDROID_API__=34" \
     -I"$NDK_JNI_INC" \
     -I"$PROJECT/jni" \
-    -I"$PG_SRC/pgandroid" \
+    -I"$PROJECT/src" \
     -I"$PG_INSTALL/include/server" \
     -o "$JNI_BRIDGE_OBJ" \
     "$JNI_BRIDGE_SRC"
@@ -354,7 +383,8 @@ echo "[pgandroid] Compiling pgandroid backend entry-point files ..."
 
 # pgandroid_main.c and pgandroid_io.c are backend translation units:
 # they use #include "postgres.h" and need android_pgandroid.h force-included.
-for src_file in "$PG_SRC/pgandroid/pgandroid_main.c" "$PG_SRC/pgandroid/pgandroid_io.c"; do
+# v2: source files live in $PROJECT/src/ (not in the PG tree).
+for src_file in "$PROJECT/src/pgandroid_main.c" "$PROJECT/src/pgandroid_io.c"; do
     base=$(basename "$src_file" .c)
     obj_file="$OUT_DIR/${base}.o"
     echo "  Compiling $base.c ..."
@@ -371,7 +401,7 @@ for src_file in "$PG_SRC/pgandroid/pgandroid_main.c" "$PG_SRC/pgandroid/pgandroi
         -include "$PG_SRC/src/include/port/android_pgandroid.h" \
         -I"$NDK_JNI_INC" \
         -I"$PROJECT/jni" \
-        -I"$PG_SRC/pgandroid" \
+        -I"$PROJECT/src" \
         -I"$PG_SRC/src/include" \
         -I"$PG_SRC/src" \
         -I"$PG_SRC/src/interfaces/libpq" \
@@ -394,6 +424,7 @@ echo ""
 echo "[pgandroid] Compiling pgandroid_initdb.c (frontend TU) ..."
 
 INITDB_OBJ="$OUT_DIR/pgandroid_initdb.o"
+# v2: source file in $PROJECT/src/, -I includes $PROJECT/src for stubs header
 # shellcheck disable=SC2086
 "$CC" \
     -c \
@@ -402,20 +433,19 @@ INITDB_OBJ="$OUT_DIR/pgandroid_initdb.o"
     -DFRONTEND \
     -DUSE_PRIVATE_ENCODING_FUNCS \
     -D__ANDROID_PGANDROID__ \
-    -DPGANDROID_INITDB_MAIN \
     "-D__ANDROID_API__=34" \
     -D_GNU_SOURCE \
     -Wno-unused-function \
     -Wno-implicit-function-declaration \
     -I"$NDK_JNI_INC" \
-    -I"$PG_SRC/pgandroid" \
+    -I"$PROJECT/src" \
     -I"$PG_SRC/src/include" \
     -I"$PG_SRC/src" \
     -I"$PG_SRC/src/interfaces/libpq" \
     -I"$PG_SRC/src/bin/initdb" \
     -I"$OPENSSL_DIR/include" \
     -o "$INITDB_OBJ" \
-    "$PG_SRC/pgandroid/pgandroid_initdb.c"
+    "$PROJECT/src/pgandroid_initdb.c"
 echo "[pgandroid] pgandroid_initdb.o compiled."
 
 # ---------------------------------------------------------------------------
@@ -482,7 +512,7 @@ PORT_OBJS=$(find "$PG_SRC/src/port" -name '*_srv.o' 2>/dev/null | tr '\n' ' ')
 TIMEZONE_OBJS=$(find "$PG_SRC/src/timezone" -name '*.o' 2>/dev/null | tr '\n' ' ')
 PGCRYPTO_OBJS=$(find "$PG_SRC/contrib/pgcrypto" -name '*.o' 2>/dev/null | tr '\n' ' ')
 # uuid-ossp skipped: no libuuid in Android NDK
-PGANDROID_OBJS=$(find "$PG_SRC/pgandroid" -name '*.o' 2>/dev/null | tr '\n' ' ')
+# v2: pgandroid objects are in $OUT_DIR (compiled from $PROJECT/src/), not $PG_SRC/pgandroid/
 
 SO_OUT="$OUT_DIR/libpgandroid.so"
 
@@ -496,6 +526,8 @@ SO_OUT="$OUT_DIR/libpgandroid.so"
 #   - pgandroid_init_with_config  (extended C API)
 #   - pgandroid_checkpoint         (extended C API)
 # shellcheck disable=SC2086
+# v2: pgandroid objects ($PGANDROID_ENTRY_OBJS) are compiled to $OUT_DIR.
+# No longer need $PGANDROID_OBJS from $PG_SRC/pgandroid/.
 "$CXX" \
     -shared \
     -fPIC \
@@ -505,7 +537,6 @@ SO_OUT="$OUT_DIR/libpgandroid.so"
     $PORT_OBJS \
     $TIMEZONE_OBJS \
     $PGCRYPTO_OBJS \
-    $PGANDROID_OBJS \
     $PGANDROID_ENTRY_OBJS \
     "$INITDB_OBJ" \
     $FE_OBJS \
@@ -527,8 +558,8 @@ fi
 # Copy headers
 # ---------------------------------------------------------------------------
 
-# Internal C API header (generated during build)
-HEADER_SRC="$PG_SRC/pgandroid/libpgandroid.h"
+# Internal C API header
+HEADER_SRC="$PROJECT/src/libpgandroid.h"
 HEADER_OUT="$OUT_DIR/libpgandroid.h"
 
 if [[ -f "$HEADER_SRC" ]]; then
