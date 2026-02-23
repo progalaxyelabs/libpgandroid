@@ -51,7 +51,7 @@ PGANDROID_EXPORT char *pgandroid_exec(const char *sql);
 /*
  * pgandroid_exec_params — execute SQL with JSON-encoded parameters.
  *
- * sql:         null-terminated UTF-8 SQL string (may contain $1, $2 … placeholders).
+ * sql:         null-terminated UTF-8 SQL string (may contain $1, $2 ... placeholders).
  * params_json: JSON array of parameter values as strings, e.g. ["42","hello"]
  *              Pass "[]" or NULL for no parameters.
  *

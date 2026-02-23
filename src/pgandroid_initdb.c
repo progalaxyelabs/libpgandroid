@@ -174,7 +174,10 @@ pgandroid_call_postgres(const char *cmd)
 
     PGANDROID_LOGI("pgandroid_call_postgres: argc=%d, argv[1]=%s", argc,
                    argc > 1 ? argv[1] : "(none)");
+    for (int i = 0; i < argc; i++)
+        PGANDROID_LOGI("  argv[%d]=%s", i, argv[i]);
     pgandroid_postgres(argc, argv);
+    PGANDROID_LOGI("pgandroid_call_postgres: pgandroid_postgres returned");
 }
 
 /*
@@ -217,21 +220,37 @@ pgandroid_pclose_v2(FILE *stream)
 
     /* Parse command string and call pgandroid_postgres() */
     pgandroid_call_postgres(pgandroid_saved_cmd);
+    PGANDROID_LOGI("pgandroid_pclose_v2: postgres returned, restoring stdin");
 
     /* Restore stdin */
     dup2(saved_stdin, STDIN_FILENO);
     close(saved_stdin);
     fclose(stream);
 
-    /* Reset state for next phase */
-    pgandroid_reset_state();
+    /*
+     * Do NOT call pgandroid_reset_state() here!  After pclose_v2 returns,
+     * initdb code continues running and needs working memory contexts
+     * (palloc, initStringInfo, etc.).  State reset happens at the START
+     * of the next pgandroid_postgres() call instead.
+     */
+    PGANDROID_LOGI("pgandroid_pclose_v2: returning 0");
 
     return 0;  /* 0 = success */
 }
 
-/* Override popen/pclose within this TU so initdb.c uses our functions */
-#define popen(cmd, type)  pgandroid_popen_v2((cmd), (type))
-#define pclose(stream)    pgandroid_pclose_v2(stream)
+/* Override popen/pclose within this TU so initdb.c uses our functions.
+ *
+ * pclose_check() lives in exec.c (separate .o) and internally calls
+ * pclose(). Our #define pclose only affects calls IN this TU. Since
+ * PG_CMD_CLOSE calls pclose_check() (which is in exec.o), the real
+ * pclose is called and our postgres invocation never happens.
+ *
+ * Fix: also redirect pclose_check → our inline wrapper that calls
+ * pgandroid_pclose_v2 instead of the real pclose.
+ */
+#define popen(cmd, type)       pgandroid_popen_v2((cmd), (type))
+#define pclose(stream)         pgandroid_pclose_v2(stream)
+#define pclose_check(stream)   pgandroid_pclose_v2(stream)
 
 /* -----------------------------------------------------------------------
  * Locale setup for initdb
@@ -247,6 +266,19 @@ pgandroid_setup_locale(void)
     setenv("LC_MONETARY", "C",          1);
     setenv("LC_NUMERIC",  "C",          1);
     setenv("LC_TIME",     "C",          1);
+}
+
+/* -----------------------------------------------------------------------
+ * find_my_exec stub — no initdb binary on Android (embedded in .so).
+ * Return success with a fake path so initdb proceeds.
+ * ----------------------------------------------------------------------- */
+static int
+pgandroid_find_my_exec(const char *argv0, char *retpath)
+{
+    (void) argv0;
+    snprintf(retpath, PATH_MAX, "/pgandroid/bin/initdb");
+    PGANDROID_LOGI("find_my_exec: stub returning fake path %s", retpath);
+    return 0;
 }
 
 /* -----------------------------------------------------------------------
@@ -274,7 +306,8 @@ pgandroid_find_other_exec(const char *argv0, const char *target,
 #define abort()     pgandroid_initdb_exit(99)
 #define atexit(fn)  pgandroid_initdb_atexit(fn)
 
-/* Redirect find_other_exec → our stub */
+/* Redirect find_my_exec/find_other_exec → our stubs */
+#define find_my_exec    pgandroid_find_my_exec
 #define find_other_exec pgandroid_find_other_exec
 
 /* Rename main → initdb_main to avoid symbol conflict */
@@ -286,14 +319,22 @@ pgandroid_find_other_exec(const char *argv0, const char *target,
 /* -----------------------------------------------------------------------
  * Frontend memory allocation.
  *
- * The .so links both frontend and backend code. With --allow-multiple-definition,
- * the backend palloc/pfree (MemoryContext-based) wins over the frontend
- * (malloc-based). initdb calls psprintf → palloc → backend MemoryContext,
- * then free() → SIGABRT (Scudo detects misaligned pointer).
+ * The .so links both frontend and backend code.  fe_memutils.c defines
+ * palloc/pfree/pg_malloc/etc using malloc/free.  The backend (mcxt.o)
+ * defines palloc/pfree using MemoryContext.  To avoid duplicate symbols
+ * and Scudo "misaligned pointer" crashes from mixing allocators, we:
  *
- * Fix: Include fe_memutils.c and psprintf.c with renamed symbols so initdb's
- * allocation calls route to the malloc-based frontend versions.
+ * 1. Rename ALL fe_memutils symbols (including palloc/pfree) during the
+ *    fe_memutils.c and psprintf.c includes so they don't conflict.
+ * 2. After the includes, #undef palloc/pfree so that initdb.c (included
+ *    next) calls the backend MemoryContext versions — matching what
+ *    separately-compiled .o files (stringinfo.o, etc.) use.
+ * 3. Keep pg_malloc/pg_strdup/pg_free/psprintf renamed so initdb.c's
+ *    malloc-based allocations stay consistent (pg_malloc→malloc,
+ *    psprintf→malloc via initdb_fe_palloc, free()→free).
  * ----------------------------------------------------------------------- */
+
+/* pg_malloc family — stays renamed throughout initdb.c */
 #define pg_malloc_internal  initdb_fe_pg_malloc_internal
 #define pg_malloc           initdb_fe_pg_malloc
 #define pg_malloc0          initdb_fe_pg_malloc0
@@ -301,18 +342,32 @@ pgandroid_find_other_exec(const char *argv0, const char *target,
 #define pg_realloc          initdb_fe_pg_realloc
 #define pg_strdup           initdb_fe_pg_strdup
 #define pg_free             initdb_fe_pg_free
+#define psprintf            initdb_fe_psprintf
+#define pvsnprintf          initdb_fe_pvsnprintf
+
+/* palloc family — renamed ONLY during fe_memutils.c/psprintf.c includes
+ * to avoid duplicate symbols with backend mcxt.o */
 #define palloc              initdb_fe_palloc
 #define palloc0             initdb_fe_palloc0
 #define palloc_extended     initdb_fe_palloc_extended
 #define pfree               initdb_fe_pfree
+#define repalloc            initdb_fe_repalloc
 #define pstrdup             initdb_fe_pstrdup
 #define pnstrdup            initdb_fe_pnstrdup
-#define repalloc            initdb_fe_repalloc
-#define psprintf            initdb_fe_psprintf
-#define pvsnprintf          initdb_fe_pvsnprintf
 
 #include "common/fe_memutils.c"
 #include "common/psprintf.c"
+
+/* Undo palloc/pfree renames so initdb.c uses backend MemoryContext versions.
+ * This ensures initdb.c's palloc/pfree match stringinfo.o and other common
+ * .o files that were compiled against the backend allocator. */
+#undef palloc
+#undef palloc0
+#undef palloc_extended
+#undef pfree
+#undef repalloc
+#undef pstrdup
+#undef pnstrdup
 
 /* -----------------------------------------------------------------------
  * Include initdb.c at file scope (single-TU frontend compilation)
@@ -322,11 +377,13 @@ pgandroid_find_other_exec(const char *argv0, const char *target,
 /* Clean up macro overrides */
 #undef dynamic_shared_memory_type
 #undef main
+#undef find_my_exec
 #undef find_other_exec
 #undef atexit
 #undef abort
 #undef _exit
 #undef exit
+#undef pclose_check
 #undef pclose
 #undef popen
 
@@ -341,7 +398,19 @@ int
 pgandroid_run_initdb(const char *datadir)
 {
     static char share_path_buf[PATH_MAX];
-    snprintf(share_path_buf, sizeof(share_path_buf), "%s/../share", datadir);
+    /* Compute share path as sibling of datadir (parent/share/).
+     * Don't use datadir/../share — the data dir may not exist yet
+     * and the kernel can't resolve '..' through a non-existent dir. */
+    {
+        char parent[PATH_MAX];
+        strlcpy(parent, datadir, sizeof(parent));
+        char *slash = strrchr(parent, '/');
+        if (slash && slash != parent)
+            *slash = '\0';
+        else
+            strlcpy(parent, ".", sizeof(parent));
+        snprintf(share_path_buf, sizeof(share_path_buf), "%s/share/postgresql", parent);
+    }
     PGANDROID_LOGI("pgandroid_run_initdb: share_path=%s", share_path_buf);
 
     const char *initdb_argv[] = {
@@ -376,7 +445,7 @@ pgandroid_run_initdb(const char *datadir)
         char fpath[PATH_MAX];
         for (int fi = 0; share_files[fi] != NULL; fi++)
         {
-            snprintf(fpath, sizeof(fpath), "%s/../share/%s", datadir, share_files[fi]);
+            snprintf(fpath, sizeof(fpath), "%s/%s", share_path_buf, share_files[fi]);
             int ok = (stat(fpath, &st) == 0 && S_ISREG(st.st_mode));
             if (!ok)
                 PGANDROID_LOGE("pgandroid_run_initdb: MISSING share file: %s (errno=%d)",
@@ -391,10 +460,16 @@ pgandroid_run_initdb(const char *datadir)
     /* Arm the longjmp target for exit() interception */
     pgandroid_initdb_exit_code = 0;
     pgandroid_initdb_jmpbuf_ready = 1;
+    PGANDROID_LOGI("pgandroid_run_initdb: about to call initdb_main");
     if (setjmp(pgandroid_initdb_jmpbuf) == 0)
     {
         initdb_main(initdb_argc, (char **)(uintptr_t)initdb_argv);
         /* initdb_main should not return — it always calls exit() */
+        PGANDROID_LOGI("pgandroid_run_initdb: initdb_main returned (unexpected)");
+    }
+    else
+    {
+        PGANDROID_LOGI("pgandroid_run_initdb: caught longjmp from exit(%d)", pgandroid_initdb_exit_code);
     }
     pgandroid_initdb_jmpbuf_ready = 0;
 

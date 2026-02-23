@@ -30,10 +30,16 @@
 #include "miscadmin.h"
 #include "tcop/tcopprot.h"
 #include "bootstrap/bootstrap.h"
+#include "storage/fd.h"
 #include "storage/ipc.h"
+#include "storage/proc.h"
+#include "storage/smgr.h"
 #include "utils/elog.h"
 #include "utils/palloc.h"
 #include "utils/memutils.h"
+#include "utils/relcache.h"
+#include "utils/catcache.h"
+#include "access/xlog.h"
 #include "postmaster/postmaster.h"   /* progname */
 
 /* Android NDK logging */
@@ -66,6 +72,14 @@ static const char *pgandroid_datadir  = NULL;
 static bool        pgandroid_ready    = false;
 static bool        pgandroid_closed   = false;
 
+/*
+ * When true, PostgresMain() sets whereToSendOutput = DestRemote so
+ * I/O goes through the wire protocol (pgandroid_io_read/write) instead
+ * of stdin/stdout.  Only the persistent backend thread sets this; the
+ * initdb --single phases keep DestDebug to read SQL from the tmpfile.
+ */
+bool pgandroid_wire_mode = false;
+
 /* -----------------------------------------------------------------------
  * pgandroid_reset_state — reset PostgreSQL state between initdb phases.
  *
@@ -86,6 +100,43 @@ pgandroid_reset_state(void)
 
     /* Clear exit callback lists so the next phase can register fresh */
     on_exit_reset();
+
+    /* Clear PGPROC so InitProcess() can allocate a fresh slot */
+    MyProc = NULL;
+
+    /*
+     * Close all kernel file descriptors tracked by the VFD table.
+     * Must happen BEFORE we null memory contexts since elog needs them.
+     * The VFD table itself becomes stale after the memory context reset,
+     * but InitFileAccess() in the next phase creates a fresh one.
+     */
+    closeAllVfds();
+
+    /*
+     * Discard smgr hash table without trying to close files (already
+     * closed by closeAllVfds above).  Without this, the next phase's
+     * cache invalidation would try to mdclose stale File handles.
+     */
+    smgr_android_reset();
+
+    /*
+     * Reset cache globals so RelationCacheInitialize/InitCatCache
+     * re-create them from scratch instead of using stale pointers.
+     *  - CacheMemoryContext: must be NULL so CreateCacheMemoryContext() runs
+     *  - criticalRelcachesBuilt: must be false so nailed-in relations get loaded
+     *  - criticalSharedRelcachesBuilt: same for shared catalogs
+     */
+    CacheMemoryContext = NULL;
+    criticalRelcachesBuilt = false;
+    criticalSharedRelcachesBuilt = false;
+
+    /*
+     * Reset XLOG process-local state: LocalXLogInsertAllowed back to -1
+     * (unknown) and LocalRecoveryInProgress back to true (recheck needed).
+     * Without this, ShutdownXLOG's "never write WAL again" flag persists
+     * into the next phase and causes PANIC in CreateCheckPoint.
+     */
+    xlog_android_reset();
 
     /* Reset memory context pointers so MemoryContextInit() creates fresh ones */
     TopMemoryContext    = NULL;
@@ -108,12 +159,20 @@ pgandroid_reset_state(void)
 void
 pgandroid_postgres(int argc, char *argv[])
 {
+    /*
+     * Reset state from any previous phase (bootstrap → single-user).
+     * This nulls TopMemoryContext, clears exit callbacks, etc.
+     * Must happen HERE (not in pclose_v2) because initdb code continues
+     * running between pclose and the next popen/pclose cycle and needs
+     * working memory contexts.
+     */
+    pgandroid_reset_state();
+
     /* Set process ID (used by various PG subsystems) */
     MyProcPid = (int) getpid();
 
-    /* Initialize memory contexts if not already done */
-    if (TopMemoryContext == NULL)
-        MemoryContextInit();
+    /* Initialize fresh memory contexts */
+    MemoryContextInit();
 
     /* Reset progname for error messages */
     progname = "postgres";
@@ -125,6 +184,10 @@ pgandroid_postgres(int argc, char *argv[])
     {
         PGANDROID_LOGI("pgandroid_postgres: calling BootstrapModeMain");
         BootstrapModeMain(argc, argv, false);
+        {
+            const char msg[] = "PGANDROID: BootstrapModeMain returned to pgandroid_postgres\n";
+            write(STDERR_FILENO, msg, sizeof(msg)-1);
+        }
         PGANDROID_LOGI("pgandroid_postgres: BootstrapModeMain returned");
     }
     else if (argc > 1 && strcmp(argv[1], "--single") == 0)
@@ -355,7 +418,14 @@ pgandroid_proto_to_json(const char *data, int len)
 
             case 'Z': /* ReadyForQuery */
                 pos = msgend;
-                goto done;
+                /*
+                 * With DestRemote, the backend sends a ReadyForQuery BEFORE
+                 * the first query response.  Skip it if we haven't seen any
+                 * query data yet; exit only when it marks end-of-response.
+                 */
+                if (in_rows_array || command_tag[0] || had_error)
+                    goto done;
+                break;
 
             default:
                 break;
@@ -410,28 +480,44 @@ static bool       pgandroid_backend_started = false;
 static void *
 pgandroid_backend_thread_func(void *arg)
 {
+    /*
+     * Backend-specific options: like ANDROID_PGOPTS but WITHOUT
+     * search_path=pg_catalog (we need public schema for DDL) and
+     * WITHOUT exit_on_error=true (errors should not kill the backend).
+     */
     const char *pg_argv[] = {
         "postgres",
         "--single",
         "-j",
-        ANDROID_PGOPTS,
+        "-c", "log_checkpoints=false",
+        "-c", "ignore_invalid_pages=on",
+        "-c", "temp_buffers=8MB",
+        "-c", "work_mem=4MB",
+        "-c", "fsync=on",
+        "-c", "synchronous_commit=on",
+        "-c", "wal_buffers=4MB",
+        "-c", "min_wal_size=80MB",
+        "-c", "shared_buffers=128MB",
         ANDROID_USERNAME,
         NULL
     };
-    int pg_argc = 26;
+    int pg_argc = 22;
 
     (void) arg;
 
     /*
-     * Initialize memory contexts after pgandroid_reset_state() cleared them
-     * following the last initdb single-user run.
+     * Reset state from the last initdb phase (MyProc, VFDs, smgr, etc.)
+     * then create fresh memory contexts.
      */
-    if (TopMemoryContext == NULL)
-        MemoryContextInit();
+    pgandroid_reset_state();
+    MemoryContextInit();
 
     MyProcPid = (int) getpid();
     progname = "postgres";
     optind = 1;
+
+    /* Enable wire protocol mode so PostgresMain uses DestRemote */
+    pgandroid_wire_mode = true;
 
     PGANDROID_LOGI("pgandroid_backend: starting PostgresSingleUserMain");
     PostgresSingleUserMain(pg_argc, (char **)(uintptr_t)pg_argv, ANDROID_USERNAME);
@@ -479,6 +565,14 @@ pgandroid_init(const char *datadir)
     pgandroid_datadir = strdup(datadir);
     setenv("PGDATA", datadir, 1);
     setenv("PGCLIENTENCODING", "UTF-8", 0);
+
+    /*
+     * Initialize memory contexts early so ErrorContext exists.
+     * Without this, any accidental backend elog() call (e.g. from
+     * combined-link symbol resolution) hits exit(2) with no message.
+     */
+    if (TopMemoryContext == NULL)
+        MemoryContextInit();
 
     pgandroid_io_init();
 

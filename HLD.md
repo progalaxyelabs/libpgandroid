@@ -210,7 +210,7 @@ Step 7: Package as .aar (optional, for distribution)
 
 | Tool | Version | Location |
 |------|---------|----------|
-| Android NDK | r27+ | /hdd1/android-dev/sdk/ndk/27.x/ |
+| Android NDK | r27+ | `$ANDROID_NDK_HOME` (e.g. `$ANDROID_SDK/ndk/27.2.12479018`) |
 | GNU Make | 4.0+ | System |
 | Autoconf | 2.69+ | System |
 | Git | 2.0+ | System |

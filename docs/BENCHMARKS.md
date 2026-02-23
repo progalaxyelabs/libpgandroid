@@ -247,7 +247,7 @@ scenarios and writes results to `logcat`:
 
 ```bash
 # Build and install
-cd /ssd2/projects/progalaxy-elabs/divisions/opensource/pgandroid/test-app
+cd test-app
 ./gradlew assembleDebug assembleAndroidTest
 
 adb install -r app/build/outputs/apk/debug/app-debug.apk
