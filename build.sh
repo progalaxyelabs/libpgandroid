@@ -324,6 +324,17 @@ echo "[extensions] Building pgcrypto objects ..."
     echo "[extensions] pgcrypto: $OBJ_COUNT object files compiled"
 )
 
+echo ""
+echo "[extensions] Building plpgsql objects ..."
+(
+    cd "$PG_SRC/src/pl/plpgsql/src"
+    # plpgsql is required for any LANGUAGE plpgsql function.
+    # Compile .o files and link them directly into libpgandroid.so.
+    make -j"$JOBS" || true
+    OBJ_COUNT=$(find . -name '*.o' | wc -l)
+    echo "[extensions] plpgsql: $OBJ_COUNT object files compiled"
+)
+
 # uuid-ossp is intentionally skipped: it requires an external UUID library
 # (ossp-uuid or e2fsprogs libuuid) that is not available in the Android NDK.
 # PostgreSQL 17 provides gen_random_uuid() natively via pgcrypto/OpenSSL,
@@ -511,6 +522,7 @@ COMMON_OBJS=$(find "$PG_SRC/src/common" -name '*_srv.o' 2>/dev/null | tr '\n' ' 
 PORT_OBJS=$(find "$PG_SRC/src/port" -name '*_srv.o' 2>/dev/null | tr '\n' ' ')
 TIMEZONE_OBJS=$(find "$PG_SRC/src/timezone" -name '*.o' 2>/dev/null | tr '\n' ' ')
 PGCRYPTO_OBJS=$(find "$PG_SRC/contrib/pgcrypto" -name '*.o' 2>/dev/null | tr '\n' ' ')
+PLPGSQL_OBJS=$(find "$PG_SRC/src/pl/plpgsql/src" -name '*.o' 2>/dev/null | tr '\n' ' ')
 # uuid-ossp skipped: no libuuid in Android NDK
 # v2: pgandroid objects are in $OUT_DIR (compiled from $PROJECT/src/), not $PG_SRC/pgandroid/
 
@@ -532,11 +544,18 @@ SO_OUT="$OUT_DIR/libpgandroid.so"
     -shared \
     -fPIC \
     -Wl,--allow-multiple-definition \
+    -Wl,--wrap=exit \
+    -Wl,--wrap=getpwuid_r \
+    -Wl,--wrap=dlopen \
+    -Wl,--export-dynamic-symbol=plpgsql_call_handler \
+    -Wl,--export-dynamic-symbol=plpgsql_inline_handler \
+    -Wl,--export-dynamic-symbol=plpgsql_validator \
     $BACKEND_OBJS \
     $COMMON_OBJS \
     $PORT_OBJS \
     $TIMEZONE_OBJS \
     $PGCRYPTO_OBJS \
+    $PLPGSQL_OBJS \
     $PGANDROID_ENTRY_OBJS \
     "$INITDB_OBJ" \
     $FE_OBJS \

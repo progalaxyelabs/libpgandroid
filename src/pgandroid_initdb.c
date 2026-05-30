@@ -42,6 +42,8 @@
 #include <setjmp.h>
 #include <getopt.h>
 #include <fcntl.h>
+#include <pwd.h>
+#include <dlfcn.h>
 
 /* -----------------------------------------------------------------------
  * Extern declarations for functions defined in pgandroid_main.c (backend TU).
@@ -71,6 +73,120 @@ pgandroid_initdb_exit(int code)
         longjmp(pgandroid_initdb_jmpbuf, 1);
     PGANDROID_LOGE("pgandroid_initdb_exit: jmpbuf NOT ready, aborting!");
     _Exit(99);
+}
+
+/*
+ * Linker-level exit() wrapper (via -Wl,--wrap=exit).
+ *
+ * The backend's proc_exit() calls exit() from compiled .o files that
+ * cannot be reached by the #define exit macro in this TU.  The linker
+ * --wrap flag redirects ALL references to exit() (across all TUs) here.
+ * __real_exit is the original libc exit, used only as last resort.
+ */
+extern void __real_exit(int code) __attribute__((noreturn));
+
+void __attribute__((noreturn))
+__wrap_exit(int code)
+{
+    if (pgandroid_initdb_jmpbuf_ready) {
+        PGANDROID_LOGI("__wrap_exit: caught exit(%d) from backend, longjmping", code);
+        pgandroid_initdb_exit_code = code;
+        longjmp(pgandroid_initdb_jmpbuf, 1);
+    }
+    /* Not in initdb context — fall through to real exit (should not happen in embedded mode) */
+    PGANDROID_LOGE("__wrap_exit: exit(%d) called outside initdb context!", code);
+    _Exit(code);
+}
+
+/*
+ * Linker-level getpwuid_r() wrapper (via -Wl,--wrap=getpwuid_r).
+ *
+ * Android/Bionic's getpwuid_r() may fail for app UIDs (10000+), returning
+ * *result = NULL.  PostgreSQL's error path in pg_get_user_home_dir() then
+ * crashes because it passes Bionic's POSIX strerror_r() return (an int)
+ * as a char* to pg_snprintf %s.
+ *
+ * We wrap getpwuid_r to provide a synthetic passwd entry for any UID,
+ * bypassing the broken error path entirely.
+ */
+extern int __real_getpwuid_r(uid_t uid, struct passwd *pwd,
+                             char *buf, size_t buflen, struct passwd **result);
+
+int
+__wrap_getpwuid_r(uid_t uid, struct passwd *pwd,
+                  char *buf, size_t buflen, struct passwd **result)
+{
+    /* Try the real getpwuid_r first */
+    int ret = __real_getpwuid_r(uid, pwd, buf, buflen, result);
+    if (ret == 0 && *result != NULL)
+        return 0;  /* success */
+
+    /* Bionic failed — synthesize a fake entry */
+    PGANDROID_LOGI("__wrap_getpwuid_r: real call failed for uid %d, synthesizing", (int)uid);
+
+    /* Fill buf with static strings: "postgres\0/data\0/bin/sh\0" */
+    static const char fake_name[] = "postgres";
+    static const char fake_dir[]  = "/data";
+    static const char fake_shell[] = "/bin/sh";
+
+    size_t needed = sizeof(fake_name) + sizeof(fake_dir) + sizeof(fake_shell);
+    if (buflen < needed) {
+        *result = NULL;
+        return ERANGE;
+    }
+
+    char *p = buf;
+    memcpy(p, fake_name, sizeof(fake_name));
+    pwd->pw_name = p;
+    p += sizeof(fake_name);
+
+    memcpy(p, fake_dir, sizeof(fake_dir));
+    pwd->pw_dir = p;
+    p += sizeof(fake_dir);
+
+    memcpy(p, fake_shell, sizeof(fake_shell));
+    pwd->pw_shell = p;
+
+    pwd->pw_passwd = pwd->pw_name;  /* dummy */
+    pwd->pw_uid = uid;
+    pwd->pw_gid = uid;
+
+    *result = pwd;
+    return 0;
+}
+
+/*
+ * Linker-level dlopen() wrapper (via -Wl,--wrap=dlopen).
+ *
+ * PostgreSQL loads extensions (plpgsql, pgcrypto) via dlopen("$libdir/<name>").
+ * In embedded mode, these are compiled directly into libpgandroid.so — there
+ * are no separate .so files.  We intercept dlopen and return a handle to
+ * libpgandroid.so itself (via RTLD_NOLOAD) so that dlsym() finds the
+ * symbols already linked in.
+ *
+ * Note: dlopen(NULL) does NOT work on Android Bionic — it returns the JVM
+ * process handle, not our .so.  We must use dlopen("libpgandroid.so", RTLD_NOLOAD)
+ * to get the correct handle.
+ */
+extern void *__real_dlopen(const char *filename, int flags);
+
+void *
+__wrap_dlopen(const char *filename, int flags)
+{
+    if (filename != NULL &&
+        (strstr(filename, "plpgsql") != NULL ||
+         strstr(filename, "pgcrypto") != NULL))
+    {
+        PGANDROID_LOGI("__wrap_dlopen: intercepted '%s' — returning libpgandroid.so handle", filename);
+        /*
+         * On Android Bionic, dlopen(NULL) returns the main executable (JVM)
+         * handle — dlsym then searches JVM symbols, not ours.  Use our
+         * specific library name with RTLD_NOLOAD to get the correct handle
+         * for the already-loaded libpgandroid.so.
+         */
+        return __real_dlopen("libpgandroid.so", RTLD_NOLOAD | RTLD_NOW);
+    }
+    return __real_dlopen(filename, flags);
 }
 
 static int
@@ -182,16 +298,40 @@ pgandroid_call_postgres(const char *cmd)
 
 /*
  * Our popen replacement — creates a tmpfile for initdb to write to.
+ *
+ * Android's tmpfile() fails because /tmp doesn't exist in the app sandbox.
+ * Use TMPDIR (set by Kotlin to context.cacheDir) with mkstemp + unlink
+ * to get the same semantics: anonymous temp file deleted on close.
  */
 static FILE *
 pgandroid_popen_v2(const char *command, const char *type)
 {
-    FILE *fp;
+    FILE *fp = NULL;
+    const char *tmpdir;
 
     (void) type;  /* always "w" from initdb */
 
     strlcpy(pgandroid_saved_cmd, command, sizeof(pgandroid_saved_cmd));
-    fp = tmpfile();
+
+    /* Try TMPDIR first (set by Kotlin to app cacheDir) */
+    tmpdir = getenv("TMPDIR");
+    if (tmpdir) {
+        char tmpl[PATH_MAX];
+        int fd;
+        snprintf(tmpl, sizeof(tmpl), "%s/pgandroid_XXXXXX", tmpdir);
+        fd = mkstemp(tmpl);
+        if (fd >= 0) {
+            unlink(tmpl);  /* anonymous — deleted when fd/fp is closed */
+            fp = fdopen(fd, "w+");
+            if (!fp)
+                close(fd);
+        }
+    }
+
+    /* Fallback to tmpfile() (works on non-Android or if /tmp exists) */
+    if (!fp)
+        fp = tmpfile();
+
     if (!fp)
         PGANDROID_LOGE("pgandroid_popen_v2: tmpfile() failed: %s", strerror(errno));
     else

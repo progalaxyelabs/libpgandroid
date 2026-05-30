@@ -567,6 +567,28 @@ pgandroid_init(const char *datadir)
     setenv("PGCLIENTENCODING", "UTF-8", 0);
 
     /*
+     * Set my_exec_path so PG can compute share/lib paths on the device.
+     * make_relative_path() derives <parent>/share/postgresql from
+     * <parent>/bin/postgres.  The binary doesn't need to exist —
+     * PG just uses the directory structure for relative path math.
+     *
+     * datadir = .../pgandroid/<dbName>
+     * parent  = .../pgandroid
+     * my_exec_path = .../pgandroid/bin/postgres
+     *  → share resolves to .../pgandroid/share/postgresql  (where we extract assets)
+     *  → pkglib resolves to .../pgandroid/lib              (not used; dlopen intercepted)
+     */
+    {
+        char parent[PATH_MAX];
+        strlcpy(parent, datadir, sizeof(parent));
+        char *slash = strrchr(parent, '/');
+        if (slash && slash != parent)
+            *slash = '\0';
+        snprintf(my_exec_path, MAXPGPATH, "%s/bin/postgres", parent);
+        PGANDROID_LOGI("pgandroid_init: my_exec_path=%s", my_exec_path);
+    }
+
+    /*
      * Initialize memory contexts early so ErrorContext exists.
      * Without this, any accidental backend elog() call (e.g. from
      * combined-link symbol resolution) hits exit(2) with no message.
@@ -636,13 +658,275 @@ pgandroid_exec(const char *sql)
 
 /*
  * pgandroid_exec_params — execute SQL with JSON-encoded parameters.
- * TODO: implement extended query protocol (Parse/Bind/Execute/Sync).
+ *
+ * Substitutes $1, $2, ... placeholders with properly escaped literal
+ * values from params_json (a JSON array: ["val1", null, "val2"]).
+ *
+ * String values are wrapped in single quotes with internal quotes doubled
+ * (standard PostgreSQL escaping).  JSON null becomes SQL NULL.
+ *
+ * Note: this performs text-based substitution rather than using the
+ * extended query protocol (Parse/Bind/Execute/Sync).  It handles the
+ * common case where $N placeholders appear outside string literals.
  */
+
+/*
+ * parse_json_string_value — parse one JSON string starting at *pos.
+ * Handles escape sequences (\", \\, \n, \r, \t, \uXXXX).
+ * Advances *pos past the closing quote.
+ * Returns malloc'd string, or NULL on error.
+ */
+static char *
+parse_json_string_value(const char *json, int *pos)
+{
+    int    cap = 128;
+    int    len = 0;
+    char  *buf = malloc(cap);
+    int    p   = *pos;
+
+    if (!buf)
+        return NULL;
+
+    /* Expect opening quote already consumed; p points inside string */
+    while (json[p] && json[p] != '"')
+    {
+        if (len + 8 >= cap)
+        {
+            cap *= 2;
+            buf  = realloc(buf, cap);
+            if (!buf)
+                return NULL;
+        }
+
+        if (json[p] == '\\' && json[p + 1])
+        {
+            p++;
+            switch (json[p])
+            {
+                case '"':  buf[len++] = '"';  break;
+                case '\\': buf[len++] = '\\'; break;
+                case 'n':  buf[len++] = '\n'; break;
+                case 'r':  buf[len++] = '\r'; break;
+                case 't':  buf[len++] = '\t'; break;
+                case '/':  buf[len++] = '/';  break;
+                case 'u':
+                    /* \uXXXX — simplified: just pass through as-is for BMP */
+                    buf[len++] = '\\';
+                    buf[len++] = 'u';
+                    break;
+                default:
+                    buf[len++] = json[p];
+                    break;
+            }
+            p++;
+        }
+        else
+        {
+            buf[len++] = json[p++];
+        }
+    }
+
+    if (json[p] == '"')
+        p++;  /* skip closing quote */
+
+    buf[len] = '\0';
+    *pos = p;
+    return buf;
+}
+
+/*
+ * parse_json_params — parse a JSON array of strings/nulls.
+ * Input:  ["val1", null, "val2"]  or  []
+ * Output: array of char* (malloc'd strings, NULL for json null).
+ *         *out_count set to number of elements.
+ * Caller must free each non-NULL element and the array itself.
+ */
+static char **
+parse_json_params(const char *json, int *out_count)
+{
+    int     cap    = 8;
+    int     count  = 0;
+    char  **params = calloc(cap, sizeof(char *));
+    int     p      = 0;
+
+    *out_count = 0;
+    if (!params || !json)
+        return params;
+
+    /* Skip whitespace and opening bracket */
+    while (json[p] && json[p] != '[')
+        p++;
+    if (json[p] == '[')
+        p++;
+
+    while (json[p])
+    {
+        /* Skip whitespace and commas */
+        while (json[p] == ' ' || json[p] == ',' || json[p] == '\t' ||
+               json[p] == '\n' || json[p] == '\r')
+            p++;
+
+        if (json[p] == ']' || json[p] == '\0')
+            break;
+
+        /* Grow array if needed */
+        if (count >= cap)
+        {
+            cap *= 2;
+            params = realloc(params, cap * sizeof(char *));
+            if (!params)
+                return NULL;
+        }
+
+        if (json[p] == '"')
+        {
+            /* String value */
+            p++;  /* skip opening quote */
+            params[count] = parse_json_string_value(json, &p);
+            count++;
+        }
+        else if (strncmp(json + p, "null", 4) == 0)
+        {
+            /* JSON null → SQL NULL */
+            params[count] = NULL;
+            count++;
+            p += 4;
+        }
+        else
+        {
+            /* Skip unexpected token */
+            p++;
+        }
+    }
+
+    *out_count = count;
+    return params;
+}
+
+/*
+ * expand_sql_params — replace $1, $2, ... in SQL with escaped literals.
+ * Returns malloc'd expanded SQL string.
+ */
+static char *
+expand_sql_params(const char *sql, char **params, int nparams)
+{
+    int    sql_len = (int) strlen(sql);
+    int    cap     = sql_len * 2 + 256;
+    int    len     = 0;
+    char  *out     = malloc(cap);
+    int    i       = 0;
+
+    if (!out)
+        return NULL;
+
+    while (sql[i])
+    {
+        /* Check for $N placeholder */
+        if (sql[i] == '$' && sql[i + 1] >= '1' && sql[i + 1] <= '9')
+        {
+            /* Parse the parameter number */
+            int param_num = 0;
+            int j = i + 1;
+            while (sql[j] >= '0' && sql[j] <= '9')
+            {
+                param_num = param_num * 10 + (sql[j] - '0');
+                j++;
+            }
+
+            if (param_num >= 1 && param_num <= nparams)
+            {
+                int idx = param_num - 1;  /* 0-based */
+                if (params[idx] == NULL)
+                {
+                    /* NULL literal */
+                    const char *null_str = "NULL";
+                    int nl = 4;
+                    if (len + nl + 1 >= cap)
+                    {
+                        cap = (len + nl + 8) * 2;
+                        out = realloc(out, cap);
+                        if (!out) return NULL;
+                    }
+                    memcpy(out + len, null_str, nl);
+                    len += nl;
+                }
+                else
+                {
+                    /* Quoted literal with escaped single quotes */
+                    const char *val = params[idx];
+                    int vlen = (int) strlen(val);
+                    /* Worst case: every char is a quote (doubled) + 2 surrounding quotes */
+                    if (len + vlen * 2 + 4 >= cap)
+                    {
+                        cap = (len + vlen * 2 + 8) * 2;
+                        out = realloc(out, cap);
+                        if (!out) return NULL;
+                    }
+                    out[len++] = '\'';
+                    for (int k = 0; k < vlen; k++)
+                    {
+                        if (val[k] == '\'')
+                            out[len++] = '\'';  /* double the quote */
+                        out[len++] = val[k];
+                    }
+                    out[len++] = '\'';
+                }
+                i = j;  /* advance past $N */
+                continue;
+            }
+        }
+
+        /* Regular character — copy through */
+        if (len + 2 >= cap)
+        {
+            cap *= 2;
+            out = realloc(out, cap);
+            if (!out) return NULL;
+        }
+        out[len++] = sql[i++];
+    }
+
+    out[len] = '\0';
+    return out;
+}
+
 PGANDROID_EXPORT char *
 pgandroid_exec_params(const char *sql, const char *params_json)
 {
-    (void) params_json;
-    return pgandroid_exec(sql);
+    char  **params = NULL;
+    int     nparams = 0;
+    char   *expanded;
+    char   *result;
+
+    /* No params or empty array — execute directly */
+    if (!params_json || strcmp(params_json, "[]") == 0)
+        return pgandroid_exec(sql);
+
+    params = parse_json_params(params_json, &nparams);
+    if (!params || nparams == 0)
+    {
+        free(params);
+        return pgandroid_exec(sql);
+    }
+
+    expanded = expand_sql_params(sql, params, nparams);
+    if (!expanded)
+    {
+        for (int i = 0; i < nparams; i++)
+            free(params[i]);
+        free(params);
+        return pgandroid_exec(sql);
+    }
+
+    PGANDROID_LOGI("pgandroid_exec_params: expanded SQL: %.200s", expanded);
+    result = pgandroid_exec(expanded);
+
+    free(expanded);
+    for (int i = 0; i < nparams; i++)
+        free(params[i]);
+    free(params);
+
+    return result;
 }
 
 /*
